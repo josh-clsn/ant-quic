@@ -20,13 +20,46 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
+
+use tokio_util::sync::CancellationToken;
 
 use quinn_udp::{RecvMeta, Transmit};
 
 use crate::VarInt;
 use crate::high_level::{AsyncUdpSocket, UdpSender};
 use crate::masque::UncompressedDatagram;
+
+/// Bytes a client's relay sockets moved through their relay streams,
+/// counting each frame with its 4-byte length prefix.
+#[derive(Debug, Default)]
+pub struct RelaySocketCounters {
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+}
+
+impl RelaySocketCounters {
+    /// Bytes written to relay streams.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Bytes read from relay streams.
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received.load(Ordering::Relaxed)
+    }
+
+    fn add_sent(&self, frame_len: usize) {
+        self.bytes_sent
+            .fetch_add(frame_len as u64 + 4, Ordering::Relaxed);
+    }
+
+    fn add_received(&self, frame_len: usize) {
+        self.bytes_received
+            .fetch_add(frame_len as u64 + 4, Ordering::Relaxed);
+    }
+}
 
 /// A virtual UDP socket that tunnels packets through a MASQUE relay
 /// via a persistent QUIC stream with length-prefixed framing.
@@ -39,6 +72,8 @@ pub struct MasqueRelaySocket {
     recv_waker: std::sync::Mutex<Option<Waker>>,
     /// Channel for outbound packets (written to the relay stream by background task)
     send_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    /// Ends both stream tasks (see [`Self::close`]).
+    closed: CancellationToken,
 }
 
 impl fmt::Debug for MasqueRelaySocket {
@@ -60,26 +95,52 @@ impl MasqueRelaySocket {
     /// - Read from `recv_stream`, decode frames, queue for `poll_recv`
     /// - Read from `send_tx` channel, write length-prefixed frames to `send_stream`
     pub fn new(
+        send_stream: crate::high_level::SendStream,
+        recv_stream: crate::high_level::RecvStream,
+        relay_public_addr: SocketAddr,
+    ) -> Arc<Self> {
+        Self::with_counters(
+            send_stream,
+            recv_stream,
+            relay_public_addr,
+            Arc::new(RelaySocketCounters::default()),
+        )
+    }
+
+    /// [`Self::new`], adding the bytes it moves to `counters`.
+    pub fn with_counters(
         mut send_stream: crate::high_level::SendStream,
         mut recv_stream: crate::high_level::RecvStream,
         relay_public_addr: SocketAddr,
+        counters: Arc<RelaySocketCounters>,
     ) -> Arc<Self> {
         let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let closed = CancellationToken::new();
 
         let socket = Arc::new(Self {
             relay_public_addr,
             recv_queue: std::sync::Mutex::new(VecDeque::new()),
             recv_waker: std::sync::Mutex::new(None),
             send_tx,
+            closed: closed.clone(),
         });
 
         // Background task: read length-prefixed frames from relay stream → queue
         let socket_ref = Arc::clone(&socket);
+        let recv_counters = Arc::clone(&counters);
+        let recv_closed = closed.clone();
         tokio::spawn(async move {
             loop {
                 // Read 4-byte length prefix
                 let mut len_buf = [0u8; 4];
-                if let Err(e) = recv_stream.read_exact(&mut len_buf).await {
+                let read = tokio::select! {
+                    _ = recv_closed.cancelled() => {
+                        let _ = recv_stream.stop(VarInt::from_u32(0));
+                        break;
+                    }
+                    read = recv_stream.read_exact(&mut len_buf) => read,
+                };
+                if let Err(e) = read {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream read error (length)");
                     break;
                 }
@@ -95,6 +156,7 @@ impl MasqueRelaySocket {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream read error (data)");
                     break;
                 }
+                recv_counters.add_received(frame_len);
 
                 // Decode as UncompressedDatagram
                 let mut cursor = Bytes::from(frame_buf);
@@ -129,7 +191,11 @@ impl MasqueRelaySocket {
         // Background task: write queued outbound packets to relay stream
         tokio::spawn(async move {
             loop {
-                let Some(encoded) = send_rx.recv().await else {
+                let next = tokio::select! {
+                    _ = closed.cancelled() => None,
+                    next = send_rx.recv() => next,
+                };
+                let Some(encoded) = next else {
                     // Every sender is gone, i.e. the socket was dropped. Nothing is
                     // half-written, so finish gracefully: QUIC keeps retransmitting
                     // frames that are queued but not yet acknowledged, so packets
@@ -153,10 +219,22 @@ impl MasqueRelaySocket {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (data)");
                     return;
                 }
+                counters.add_sent(encoded.len());
             }
         });
 
         socket
+    }
+
+    /// End the relay session this socket carries: the send half finishes,
+    /// the receive half is stopped, and later sends fail. Idempotent.
+    pub fn close(&self) {
+        self.closed.cancel();
+    }
+
+    /// Whether [`Self::close`] was called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.is_cancelled()
     }
 }
 

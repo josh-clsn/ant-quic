@@ -357,9 +357,9 @@ pub use endpoint::{
     Incoming,
 };
 pub use nat_traversal_api::{
-    BootstrapNode, CandidateAddress, NatTraversalConfig, NatTraversalEndpoint, NatTraversalError,
-    NatTraversalEvent, NatTraversalStatistics, PeerId, TraversalDeadlineKind,
-    TraversalFailureReason,
+    BootstrapNode, CandidateAddress, CoordinatorPolicy, IntroducerStats, NatTraversalConfig,
+    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics, PeerId,
+    RelayClientStats, TraversalDeadlineKind, TraversalFailureReason,
 };
 pub use reachability::{ReachabilityScope, TraversalMethod};
 

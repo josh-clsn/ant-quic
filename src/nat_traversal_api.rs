@@ -1554,6 +1554,92 @@ pub struct RelaySession {
     pub relay_addr: SocketAddr,
 }
 
+/// Bound on targets with recorded introducer hints.
+const MAX_INTRODUCER_HINT_PEERS: usize = 4096;
+/// Bound on the introducers kept per target.
+const MAX_INTRODUCERS_PER_PEER: usize = 8;
+
+/// Which coordinators hole punching may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum CoordinatorPolicy {
+    /// Any candidate: preferred and hinted coordinators, cached ones, live
+    /// peers and known peers (bootstrap seeds among them), dialled first
+    /// when not connected. A peer-id-only connect may also dial every known
+    /// peer to find one. The default.
+    #[default]
+    Any = 0,
+    /// Only a peer with a live connection; nothing is dialled to coordinate,
+    /// and a peer-id-only connect dials no known peer.
+    ConnectedOnly = 1,
+    /// As [`Self::ConnectedOnly`], except that a connect to a target may
+    /// dial one introducer: first one the target named for itself
+    /// ([`NatTraversalEndpoint::set_peer_introducers`]), else a known peer.
+    /// Each target gets one per budget
+    /// ([`NatTraversalEndpoint::reset_introducer_budget`]), and the
+    /// introducer connection is closed as soon as the punch resolves,
+    /// success or failure. Introducers only coordinate; with relay fallback
+    /// off they never carry data.
+    Introducer = 2,
+}
+
+impl CoordinatorPolicy {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::ConnectedOnly,
+            2 => Self::Introducer,
+            _ => Self::Any,
+        }
+    }
+}
+
+/// One open introducer: how many connects hold it, whether one of them
+/// has dialled it (the only dial) and whether that dial failed, the
+/// connection that dial made, and whether the last holder is hanging up on
+/// it.
+#[derive(Debug, Default)]
+struct IntroducerEntry {
+    holders: usize,
+    dialed: bool,
+    /// The one dial failed: holders waiting for it stop at once.
+    dial_failed: bool,
+    connection: Option<usize>,
+    closing: bool,
+}
+
+/// Introducer use under [`CoordinatorPolicy::Introducer`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntroducerStats {
+    /// Introducer connections dialled.
+    pub dials: u64,
+    /// UDP bytes sent on them, counted when each was closed.
+    pub bytes_sent: u64,
+    /// UDP bytes received on them, counted when each was closed.
+    pub bytes_received: u64,
+}
+
+/// A snapshot of an endpoint's client relay sessions
+/// ([`NatTraversalEndpoint::relay_client_stats`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayClientStats {
+    /// Sessions whose relay connection is still open.
+    pub active_sessions: usize,
+    /// The relay server of each open session (the same sessions
+    /// `active_sessions` counts).
+    pub relay_servers: Vec<SocketAddr>,
+    /// The relay address proactive relay advertises, if any.
+    pub relay_public_addr: Option<SocketAddr>,
+    /// Bytes written to relay streams since the endpoint started, including
+    /// sessions closed since. Each frame counts with its 4-byte prefix; QUIC
+    /// overhead on the relay connection is not included. When a session
+    /// reuses an existing connection to the relay, these bytes also show in
+    /// that connection's own stats, so do not add the two.
+    pub bytes_sent: u64,
+    /// Bytes read from relay streams since the endpoint started, counted the
+    /// same way.
+    pub bytes_received: u64,
+}
+
 impl RelaySession {
     /// Check if the session is still active
     pub fn is_active(&self) -> bool {
@@ -1715,6 +1801,69 @@ pub struct NatTraversalEndpoint {
     relay_public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     /// Peers already advertised the relay address to
     relay_advertised_peers: Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
+    /// ADD_ADDRESS sequence of the relay address advertised to each peer
+    /// address, so a pause can withdraw it with REMOVE_ADDRESS.
+    relay_advert_sequences: Arc<std::sync::Mutex<HashMap<SocketAddr, u64>>>,
+    /// Whether the proactive relay manager may hold a client relay session.
+    /// The manager subscribes to it; see
+    /// [`NatTraversalEndpoint::set_proactive_relay_allowed`].
+    proactive_relay_allowed: tokio::sync::watch::Sender<bool>,
+    /// Bytes every client relay socket of this endpoint moved.
+    relay_client_bytes: Arc<crate::masque::RelaySocketCounters>,
+    /// Bumped on every `set_proactive_relay_allowed(false)`, so a setup can
+    /// tell that the switch went off while it ran, even if it is back on.
+    proactive_relay_pauses: AtomicU64,
+    /// Whether a connect may fall back to a MASQUE relay.
+    relay_fallback_allowed: AtomicBool,
+    /// Which coordinators hole punching may use ([`CoordinatorPolicy`]).
+    coordinator_policy: std::sync::atomic::AtomicU8,
+    /// Per target: the introducers it named for itself (its own hints),
+    /// tried first under [`CoordinatorPolicy::Introducer`].
+    introducer_hints: ParkingMutex<HashMap<PeerId, Vec<SocketAddr>>>,
+    /// Targets that used their one introducer since the last
+    /// [`NatTraversalEndpoint::reset_introducer_budget`].
+    introducer_spent: ParkingMutex<HashSet<PeerId>>,
+    introducer_dials: AtomicU64,
+    /// Open introducers by address ([`IntroducerEntry`]).
+    introducer_refs: ParkingMutex<HashMap<SocketAddr, IntroducerEntry>>,
+    #[cfg(test)]
+    /// Parks a connect to the armed target just after it took an
+    /// introducer.
+    introducer_pick_gate: ParkingMutex<
+        Option<(
+            PeerId,
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    introducer_test_fail_hold: ParkingMutex<HashSet<SocketAddr>>,
+    #[cfg(test)]
+    introducer_test_fail_dial: ParkingMutex<HashSet<SocketAddr>>,
+    #[cfg(test)]
+    introducer_test_waits_cut_short: AtomicU64,
+    #[cfg(test)]
+    /// Parks `close_introducer` just before it disconnects.
+    introducer_close_gate: ParkingMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    introducer_hangups: AtomicU64,
+    #[cfg(test)]
+    punch_starts_via: ParkingMutex<HashMap<SocketAddr, usize>>,
+    introducer_bytes_sent: AtomicU64,
+    introducer_bytes_received: AtomicU64,
+    #[cfg(test)]
+    /// Parks `setup_proactive_relay` just before it returns `Ok`.
+    setup_return_gate: ParkingMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     #[cfg(test)]
     /// Synthetic observed external addresses for tests that do not open a real
     /// QUIC connection.
@@ -1744,7 +1893,7 @@ pub struct NatTraversalEndpoint {
     listener_shutdown_timeout: ParkingMutex<Option<Duration>>,
     #[cfg(test)]
     force_listener_confirmation_timeout: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     force_symmetric_nat: std::sync::atomic::AtomicBool,
     /// Constrained protocol engine for BLE/LoRa/Serial transports
     /// Handles the constrained protocol for non-UDP transports
@@ -3099,6 +3248,34 @@ impl NatTraversalEndpoint {
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            relay_advert_sequences: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            proactive_relay_allowed: tokio::sync::watch::Sender::new(true),
+            relay_client_bytes: Arc::new(crate::masque::RelaySocketCounters::default()),
+            proactive_relay_pauses: AtomicU64::new(0),
+            relay_fallback_allowed: AtomicBool::new(true),
+            coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
+            introducer_hints: ParkingMutex::new(HashMap::new()),
+            introducer_spent: ParkingMutex::new(HashSet::new()),
+            introducer_dials: AtomicU64::new(0),
+            introducer_refs: ParkingMutex::new(HashMap::new()),
+            #[cfg(test)]
+            introducer_pick_gate: ParkingMutex::new(None),
+            #[cfg(test)]
+            introducer_close_gate: ParkingMutex::new(None),
+            #[cfg(test)]
+            introducer_test_fail_hold: ParkingMutex::new(HashSet::new()),
+            #[cfg(test)]
+            introducer_test_fail_dial: ParkingMutex::new(HashSet::new()),
+            #[cfg(test)]
+            introducer_test_waits_cut_short: AtomicU64::new(0),
+            #[cfg(test)]
+            introducer_hangups: AtomicU64::new(0),
+            #[cfg(test)]
+            punch_starts_via: ParkingMutex::new(HashMap::new()),
+            introducer_bytes_sent: AtomicU64::new(0),
+            introducer_bytes_received: AtomicU64::new(0),
+            #[cfg(test)]
+            setup_return_gate: ParkingMutex::new(None),
             #[cfg(test)]
             test_observed_external_addrs: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
@@ -3118,7 +3295,7 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             force_symmetric_nat: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
@@ -3629,6 +3806,34 @@ impl NatTraversalEndpoint {
             relay_advertised_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            relay_advert_sequences: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            proactive_relay_allowed: tokio::sync::watch::Sender::new(true),
+            relay_client_bytes: Arc::new(crate::masque::RelaySocketCounters::default()),
+            proactive_relay_pauses: AtomicU64::new(0),
+            relay_fallback_allowed: AtomicBool::new(true),
+            coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
+            introducer_hints: ParkingMutex::new(HashMap::new()),
+            introducer_spent: ParkingMutex::new(HashSet::new()),
+            introducer_dials: AtomicU64::new(0),
+            introducer_refs: ParkingMutex::new(HashMap::new()),
+            #[cfg(test)]
+            introducer_pick_gate: ParkingMutex::new(None),
+            #[cfg(test)]
+            introducer_close_gate: ParkingMutex::new(None),
+            #[cfg(test)]
+            introducer_test_fail_hold: ParkingMutex::new(HashSet::new()),
+            #[cfg(test)]
+            introducer_test_fail_dial: ParkingMutex::new(HashSet::new()),
+            #[cfg(test)]
+            introducer_test_waits_cut_short: AtomicU64::new(0),
+            #[cfg(test)]
+            introducer_hangups: AtomicU64::new(0),
+            #[cfg(test)]
+            punch_starts_via: ParkingMutex::new(HashMap::new()),
+            introducer_bytes_sent: AtomicU64::new(0),
+            introducer_bytes_received: AtomicU64::new(0),
+            #[cfg(test)]
+            setup_return_gate: ParkingMutex::new(None),
             #[cfg(test)]
             test_observed_external_addrs: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
@@ -3648,7 +3853,7 @@ impl NatTraversalEndpoint {
             listener_shutdown_timeout: ParkingMutex::new(None),
             #[cfg(test)]
             force_listener_confirmation_timeout: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             force_symmetric_nat: std::sync::atomic::AtomicBool::new(false),
             constrained_engine,
             constrained_event_tx: constrained_event_tx.clone(),
@@ -3939,7 +4144,7 @@ impl NatTraversalEndpoint {
     /// setup. It is not a full NAT classification and does not prove filtering
     /// behavior or long-term mapping stability.
     pub(crate) fn is_symmetric_nat(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if self
             .force_symmetric_nat
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -3975,6 +4180,11 @@ impl NatTraversalEndpoint {
         &self,
         bootstrap_addr: SocketAddr,
     ) -> Result<SocketAddr, NatTraversalError> {
+        if !self.proactive_relay_allowed() {
+            return Err(NatTraversalError::ConnectionFailed(
+                "proactive relay is not allowed".to_string(),
+            ));
+        }
         info!(
             "Setting up proactive relay via bootstrap {} for symmetric NAT",
             bootstrap_addr
@@ -3983,6 +4193,15 @@ impl NatTraversalEndpoint {
         // Step 1: Establish or reuse the shared relay endpoint.
         let (public_addr, relay_endpoint) =
             self.ensure_shared_relay_endpoint(bootstrap_addr).await?;
+        // The switch may have turned off while the session was being set
+        // up. Do not let it finish into an active, advertised relay.
+        if !self.proactive_relay_allowed() {
+            drop(relay_endpoint);
+            self.close_client_relay();
+            return Err(NatTraversalError::ConnectionFailed(
+                "proactive relay is not allowed".to_string(),
+            ));
+        }
         let relay_public_addr = public_addr.ok_or_else(|| {
             NatTraversalError::ConnectionFailed("Relay did not provide public address".to_string())
         })?;
@@ -4142,6 +4361,15 @@ impl NatTraversalEndpoint {
             relay_public_addr, advertised
         );
 
+        #[cfg(test)]
+        {
+            let gate = self.setup_return_gate.lock().take();
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+        }
+
         Ok(relay_public_addr)
     }
 
@@ -4281,6 +4509,9 @@ impl NatTraversalEndpoint {
                 if let Ok(mut peers) = self.relay_advertised_peers.lock() {
                     peers.insert(remote_addr);
                 }
+                if let Ok(mut sequences) = self.relay_advert_sequences.lock() {
+                    sequences.insert(remote_addr, sequence);
+                }
                 info!(
                     peer_id = ?peer_id,
                     remote_addr = %remote_addr,
@@ -4301,6 +4532,14 @@ impl NatTraversalEndpoint {
                 false
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn relay_server_sessions_created_for_test(&self) -> u64 {
+        self.relay_server
+            .as_ref()
+            .map(|server| server.stats().sessions_created.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -7330,6 +7569,11 @@ impl NatTraversalEndpoint {
         }
 
         // Step 3: Relay is the last resort
+        if !self.relay_fallback_allowed() {
+            return Err(NatTraversalError::ConnectionFailed(
+                "direct and hole-punch attempts failed; relay fallback is not allowed".to_string(),
+            ));
+        }
         info!("Attempting relay connection to {:?} (last resort)", peer_id);
 
         // Symmetric P2P: Collect connected peers to use as potential relays
@@ -7473,6 +7717,8 @@ impl NatTraversalEndpoint {
         if let Ok(mut peers) = self.relay_advertised_peers.lock() {
             peers.clear();
         }
+        // Withdraw the dead relay address before forgetting where it went.
+        self.withdraw_relay_adverts();
         // Remove dead sessions
         self.relay_sessions.retain(|_, session| session.is_active());
         info!("Relay state reset — will re-establish on next poll cycle");
@@ -7685,10 +7931,11 @@ impl NatTraversalEndpoint {
         // ownership of both halves and keeps them open for data forwarding, which
         // is why the handshake above deliberately does not finish the send half.
         let relay_socket = match public_address {
-            Some(addr) => Some(crate::masque::MasqueRelaySocket::new(
+            Some(addr) => Some(crate::masque::MasqueRelaySocket::with_counters(
                 send_stream,
                 recv_stream,
                 addr,
+                Arc::clone(&self.relay_client_bytes),
             )),
             None => {
                 // No public address means there is no socket to hand the streams
@@ -7773,6 +8020,480 @@ impl NatTraversalEndpoint {
     /// Get active relay sessions
     pub fn relay_sessions(&self) -> Arc<dashmap::DashMap<SocketAddr, RelaySession>> {
         self.relay_sessions.clone()
+    }
+
+    /// Whether the proactive relay manager may hold a client relay session.
+    pub fn proactive_relay_allowed(&self) -> bool {
+        *self.proactive_relay_allowed.borrow()
+    }
+
+    /// Allow or stop proactive relay for a symmetric NAT.
+    ///
+    /// Turning it off closes every client relay session this endpoint holds
+    /// (see [`Self::close_client_relay`]), and the proactive relay manager
+    /// starts none until it is turned on again. Turning it on makes the
+    /// manager check again at once, without waiting for the next connection
+    /// or address event. Relay fallback dials have their own switch,
+    /// [`Self::set_relay_fallback_allowed`]. Turning this one off still
+    /// closes any session they opened.
+    pub fn set_proactive_relay_allowed(&self, allowed: bool) {
+        if !allowed {
+            self.proactive_relay_pauses.fetch_add(1, Ordering::SeqCst);
+        }
+        self.proactive_relay_allowed.send_replace(allowed);
+        if !allowed {
+            self.close_client_relay();
+        }
+    }
+
+    /// How many times proactive relay has been turned off. A setup that
+    /// sees this change while it ran treats it as a pause, even when the
+    /// switch is back on.
+    pub(crate) fn proactive_relay_pauses(&self) -> u64 {
+        self.proactive_relay_pauses.load(Ordering::SeqCst)
+    }
+
+    /// Whether a connect may fall back to a MASQUE relay.
+    pub fn relay_fallback_allowed(&self) -> bool {
+        self.relay_fallback_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Allow or refuse relay fallback for connects. With `false`, the relay
+    /// stage of a connect is skipped (the connect fails once the direct and
+    /// hole-punch stages have), and a relay connection attempt is refused.
+    /// Sessions already open are not closed by this; see
+    /// [`Self::set_proactive_relay_allowed`]. Allowed by default.
+    pub fn set_relay_fallback_allowed(&self, allowed: bool) {
+        self.relay_fallback_allowed.store(allowed, Ordering::SeqCst);
+    }
+
+    /// Which coordinators hole punching may use.
+    pub fn coordinator_policy(&self) -> CoordinatorPolicy {
+        CoordinatorPolicy::from_u8(self.coordinator_policy.load(Ordering::SeqCst))
+    }
+
+    /// Set which coordinators hole punching may use (see
+    /// [`CoordinatorPolicy`]). The introducer budget is not touched: the
+    /// embedder starts a new one with [`Self::reset_introducer_budget`] (for
+    /// example at the start of each burst).
+    pub fn set_coordinator_policy(&self, policy: CoordinatorPolicy) {
+        self.coordinator_policy
+            .store(policy as u8, Ordering::SeqCst);
+    }
+
+    /// Record the introducers `peer` named for itself (for example the
+    /// coordinators it announces it is reachable through). Under
+    /// [`CoordinatorPolicy::Introducer`] they are tried before known peers.
+    /// An empty list forgets them.
+    pub fn set_peer_introducers(&self, peer: PeerId, introducers: Vec<SocketAddr>) {
+        let mut hints = self.introducer_hints.lock();
+        if introducers.is_empty() {
+            hints.remove(&peer);
+            return;
+        }
+        if hints.len() >= MAX_INTRODUCER_HINT_PEERS && !hints.contains_key(&peer) {
+            hints.clear();
+        }
+        let introducers = introducers
+            .into_iter()
+            .map(normalize_socket_addr)
+            .take(MAX_INTRODUCERS_PER_PEER)
+            .collect();
+        hints.insert(peer, introducers);
+    }
+
+    pub(crate) fn introducer_hints_for(&self, peer: &PeerId) -> Vec<SocketAddr> {
+        self.introducer_hints
+            .lock()
+            .get(peer)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Let every target use one introducer again (a new burst).
+    pub fn reset_introducer_budget(&self) {
+        self.introducer_spent.lock().clear();
+    }
+
+    /// Spend `peer`'s one introducer for this budget. Returns false when it
+    /// was already spent.
+    pub(crate) fn spend_introducer(&self, peer: PeerId) -> bool {
+        self.introducer_spent.lock().insert(peer)
+    }
+
+    /// Hold the introducer at `addr`: join an open entry, or start one.
+    /// Refused while that introducer is closing. Returns whether this call
+    /// started the entry.
+    pub(crate) fn hold_introducer(&self, addr: SocketAddr) -> Option<bool> {
+        #[cfg(test)]
+        if self.introducer_test_fail_hold.lock().remove(&addr) {
+            return None;
+        }
+        let mut refs = self.introducer_refs.lock();
+        match refs.get_mut(&addr) {
+            Some(entry) if entry.closing => None,
+            Some(entry) => {
+                entry.holders += 1;
+                Some(false)
+            }
+            None => {
+                refs.insert(
+                    addr,
+                    IntroducerEntry {
+                        holders: 1,
+                        ..IntroducerEntry::default()
+                    },
+                );
+                Some(true)
+            }
+        }
+    }
+
+    /// Join an introducer another connect holds (not one that is closing).
+    pub(crate) fn share_introducer(&self, addr: SocketAddr) -> bool {
+        match self.introducer_refs.lock().get_mut(&addr) {
+            Some(entry) if !entry.closing => {
+                entry.holders += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `addr` is an introducer that some connect holds.
+    pub(crate) fn introducer_is_held(&self, addr: SocketAddr) -> bool {
+        self.introducer_refs
+            .lock()
+            .get(&addr)
+            .is_some_and(|entry| !entry.closing)
+    }
+
+    /// Whether `addr` is an introducer being hung up on.
+    pub(crate) fn introducer_is_closing(&self, addr: SocketAddr) -> bool {
+        self.introducer_refs
+            .lock()
+            .get(&addr)
+            .is_some_and(|entry| entry.closing)
+    }
+
+    /// Claim the one dial of the introducer at `addr`. The first holder to
+    /// reach its punch while the introducer is not connected wins; the
+    /// others wait for that connection. Never twice per entry.
+    pub(crate) fn claim_introducer_dial(&self, addr: SocketAddr) -> bool {
+        match self.introducer_refs.lock().get_mut(&addr) {
+            Some(entry) if !entry.closing && !entry.dialed => {
+                entry.dialed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The one dial of the introducer at `addr` failed. Holders waiting for
+    /// it stop at once instead of polling to their deadline.
+    pub(crate) fn mark_introducer_dial_failed(&self, addr: SocketAddr) {
+        if let Some(entry) = self.introducer_refs.lock().get_mut(&addr) {
+            entry.dial_failed = true;
+        }
+    }
+
+    /// Whether the one dial of the introducer at `addr` failed.
+    pub(crate) fn introducer_dial_failed(&self, addr: SocketAddr) -> bool {
+        self.introducer_refs
+            .lock()
+            .get(&addr)
+            .is_some_and(|entry| entry.dial_failed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_introducer_hold_for_test(&self, addr: SocketAddr) {
+        self.introducer_test_fail_hold.lock().insert(addr);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_introducer_dials_for_test(&self, addr: SocketAddr) {
+        self.introducer_test_fail_dial.lock().insert(addr);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn introducer_dial_fails_for_test(&self, addr: SocketAddr) -> bool {
+        self.introducer_test_fail_dial.lock().contains(&addr)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_introducer_wait_cut_short_for_test(&self) {
+        self.introducer_test_waits_cut_short
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn introducer_waits_cut_short_for_test(&self) -> u64 {
+        self.introducer_test_waits_cut_short.load(Ordering::SeqCst)
+    }
+
+    /// Record which connection the introducer dial made, so the hang-up
+    /// closes that connection and no other.
+    pub(crate) fn note_introducer_connection(&self, addr: SocketAddr, stable_id: usize) {
+        if let Some(entry) = self.introducer_refs.lock().get_mut(&addr) {
+            entry.connection = Some(stable_id);
+        }
+    }
+
+    /// Release a hold. The last release marks the entry closing and returns
+    /// the connection to close (`Some(None)` when it never dialled); the
+    /// caller closes it and then calls [`Self::finish_introducer_close`].
+    pub(crate) fn release_introducer(&self, addr: SocketAddr) -> Option<Option<usize>> {
+        let mut refs = self.introducer_refs.lock();
+        let entry = refs.get_mut(&addr)?;
+        if entry.closing {
+            return None;
+        }
+        entry.holders = entry.holders.saturating_sub(1);
+        if entry.holders > 0 {
+            return None;
+        }
+        entry.closing = true;
+        Some(entry.connection)
+    }
+
+    /// The hang-up has finished: forget the entry.
+    pub(crate) fn finish_introducer_close(&self, addr: SocketAddr) {
+        let mut refs = self.introducer_refs.lock();
+        if refs.get(&addr).is_some_and(|entry| entry.closing) {
+            refs.remove(&addr);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn introducer_holders_for_test(&self, addr: SocketAddr) -> usize {
+        self.introducer_refs
+            .lock()
+            .get(&addr)
+            .map_or(0, |entry| entry.holders)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_introducer_pick_gate_for_test(
+        &self,
+        target: PeerId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.introducer_pick_gate.lock() = Some((target, reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn introducer_pick_gate_for_test(&self, target: PeerId) {
+        let gate = {
+            let mut gate = self.introducer_pick_gate.lock();
+            if gate.as_ref().is_some_and(|(armed, _, _)| *armed == target) {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, reached, release)) = gate {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_introducer_close_gate_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.introducer_close_gate.lock() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn introducer_close_gate_for_test(&self) {
+        let gate = self.introducer_close_gate.lock().take();
+        if let Some((reached, release)) = gate {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_introducer_hangup_for_test(&self) {
+        self.introducer_hangups.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn introducer_hangups_for_test(&self) -> u64 {
+        self.introducer_hangups.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_punch_start_for_test(&self, coordinator: SocketAddr) {
+        *self.punch_starts_via.lock().entry(coordinator).or_insert(0) += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn punch_starts_via_for_test(&self, coordinator: SocketAddr) -> usize {
+        self.punch_starts_via
+            .lock()
+            .get(&coordinator)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn record_introducer_dial(&self) {
+        self.introducer_dials.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_introducer_bytes(&self, sent: u64, received: u64) {
+        self.introducer_bytes_sent
+            .fetch_add(sent, Ordering::Relaxed);
+        self.introducer_bytes_received
+            .fetch_add(received, Ordering::Relaxed);
+    }
+
+    /// Introducer connections dialled under [`CoordinatorPolicy::Introducer`]
+    /// and the UDP bytes they carried, counted when each was closed.
+    pub fn introducer_stats(&self) -> IntroducerStats {
+        IntroducerStats {
+            dials: self.introducer_dials.load(Ordering::Relaxed),
+            bytes_sent: self.introducer_bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.introducer_bytes_received.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Send REMOVE_ADDRESS for the relay address to every connected peer it
+    /// was advertised to, and forget the sequences.
+    fn withdraw_relay_adverts(&self) {
+        let sequences: HashMap<SocketAddr, u64> = self
+            .relay_advert_sequences
+            .lock()
+            .map(|mut sequences| std::mem::take(&mut *sequences))
+            .unwrap_or_default();
+        if sequences.is_empty() {
+            return;
+        }
+        for entry in self.connections.iter() {
+            let connection = entry.value();
+            if let Some(sequence) = sequences.get(&connection.remote_address()) {
+                if let Err(error) = connection.send_nat_address_removal(*sequence) {
+                    debug!(%error, "failed to withdraw the relay address from a peer");
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_setup_return_gate_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.setup_return_gate.lock() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Subscribe to [`Self::set_proactive_relay_allowed`] changes.
+    pub(crate) fn subscribe_proactive_relay_allowed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.proactive_relay_allowed.subscribe()
+    }
+
+    /// Close every client relay session: withdraw the relay address from the
+    /// peers it was advertised to, close the shared relay endpoint (and the
+    /// connections that arrived through it), end each session's CONNECT-UDP
+    /// stream, close a relay connection opened only for the session (a peer
+    /// connection that was reused stays up), and clear the relay state.
+    /// Returns whether anything was open. Idempotent.
+    pub fn close_client_relay(&self) -> bool {
+        let mut closed_any = false;
+
+        self.withdraw_relay_adverts();
+
+        let shared = self
+            .shared_relay_endpoint
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.take());
+        if let Some(endpoint) = shared {
+            endpoint.close(crate::VarInt::from_u32(0), b"relay closed");
+            closed_any = true;
+        }
+
+        let peer_connections: std::collections::HashSet<usize> = self
+            .connections
+            .iter()
+            .map(|entry| entry.value().stable_id())
+            .collect();
+        let relays: Vec<SocketAddr> = self
+            .relay_sessions
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        for relay in relays {
+            if let Some((_, session)) = self.relay_sessions.remove(&relay) {
+                closed_any = true;
+                if let Some(socket) = session.relay_socket.as_ref() {
+                    socket.close();
+                }
+                if !peer_connections.contains(&session.connection.stable_id())
+                    && session.connection.close_reason().is_none()
+                {
+                    session
+                        .connection
+                        .close(crate::VarInt::from_u32(0), b"relay closed");
+                }
+                info!(relay = %relay, "closed client relay session");
+            }
+        }
+
+        self.relay_setup_attempted.store(false, Ordering::Relaxed);
+        self.relay_accept_loop_started
+            .store(false, Ordering::Relaxed);
+        if let Ok(mut addr) = self.relay_public_addr.lock() {
+            closed_any |= addr.take().is_some();
+        }
+        if let Ok(mut peers) = self.relay_advertised_peers.lock() {
+            peers.clear();
+        }
+        closed_any
+    }
+
+    /// What this endpoint's client relay sessions hold and have moved.
+    pub fn relay_client_stats(&self) -> RelayClientStats {
+        RelayClientStats {
+            active_sessions: self
+                .relay_sessions
+                .iter()
+                .filter(|entry| entry.value().is_active())
+                .count(),
+            relay_servers: self
+                .relay_sessions
+                .iter()
+                .filter(|entry| entry.value().is_active())
+                .map(|entry| *entry.key())
+                .collect(),
+            relay_public_addr: self.relay_public_addr(),
+            bytes_sent: self.relay_client_bytes.bytes_sent(),
+            bytes_received: self.relay_client_bytes.bytes_received(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_shared_relay_endpoint_for_test(&self) -> bool {
+        self.shared_relay_endpoint
+            .lock()
+            .map(|shared| shared.is_some())
+            .unwrap_or(false)
     }
 
     /// Best-effort runtime metrics for the embedded relay server.
@@ -10988,7 +11709,7 @@ impl NatTraversalEndpoint {
 
     /// #305 round 2 test hook: report symmetric NAT so the proactive relay
     /// manager runs on loopback.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn force_symmetric_nat_for_test(&self) {
         self.force_symmetric_nat
             .store(true, std::sync::atomic::Ordering::Relaxed);

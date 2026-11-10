@@ -124,4 +124,4 @@ pub use relay_server::{
     SessionInfo,
 };
 pub use relay_session::{RelaySession, RelaySessionConfig, RelaySessionState, RelaySessionStats};
-pub use relay_socket::MasqueRelaySocket;
+pub use relay_socket::{MasqueRelaySocket, RelaySocketCounters};

@@ -90,6 +90,7 @@ use crate::crypto::raw_public_keys::key_utils::{
 };
 use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 use crate::mdns::{MdnsPeerRecord, MdnsRuntimeEvent, MdnsSnapshot, spawn_mdns_runtime};
+use crate::nat_traversal_api::CoordinatorPolicy;
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::UNAUTHENTICATED_GENERATION;
 use crate::nat_traversal_api::{
@@ -1178,6 +1179,63 @@ fn drop_non_global_direct_candidates_when_global_present(addrs: &mut Vec<SocketA
         .any(|addr| socket_addr_scope(*addr) == Some(ReachabilityScope::Global));
     if has_global {
         addrs.retain(|addr| socket_addr_scope(*addr) == Some(ReachabilityScope::Global));
+    }
+}
+
+/// A connect's hold on an introducer under [`CoordinatorPolicy::Introducer`].
+///
+/// Holds are counted per address, so concurrent connects share one
+/// introducer connection: the first holder to reach its punch while the
+/// introducer is not connected dials it (the only dial), the others wait for
+/// that connection, and the connection is closed when the last hold is
+/// released. While that close runs, the entry reads closing: no connect joins
+/// it or uses its connection, and only the connection the dial made is closed.
+struct IntroducerGuard {
+    endpoint: Option<P2pEndpoint>,
+    addr: SocketAddr,
+}
+
+impl IntroducerGuard {
+    /// Hold the introducer at `addr`, joining an open entry or starting one.
+    /// `None` while it is closing.
+    fn hold(endpoint: &P2pEndpoint, addr: SocketAddr) -> Option<Self> {
+        endpoint.inner.hold_introducer(addr).map(|_| Self {
+            endpoint: Some(endpoint.clone()),
+            addr,
+        })
+    }
+
+    /// Join an introducer another connect already holds. `None` when `addr`
+    /// is not one (or it is closing).
+    fn shared(endpoint: &P2pEndpoint, addr: SocketAddr) -> Option<Self> {
+        endpoint.inner.share_introducer(addr).then(|| Self {
+            endpoint: Some(endpoint.clone()),
+            addr,
+        })
+    }
+
+    async fn finish(mut self) {
+        if let Some(endpoint) = self.endpoint.take()
+            && let Some(connection) = endpoint.inner.release_introducer(self.addr)
+        {
+            endpoint.close_introducer(self.addr, connection).await;
+        }
+    }
+}
+
+impl Drop for IntroducerGuard {
+    fn drop(&mut self) {
+        if let Some(endpoint) = self.endpoint.take()
+            && let Some(connection) = endpoint.inner.release_introducer(self.addr)
+        {
+            let addr = self.addr;
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move { endpoint.close_introducer(addr, connection).await });
+                }
+                Err(_) => endpoint.inner.finish_introducer_close(addr),
+            }
+        }
     }
 }
 
@@ -4652,6 +4710,13 @@ impl P2pEndpoint {
             }
         }
 
+        // A switched-off endpoint dials no coordinator: only a peer it is
+        // already connected to may coordinate.
+        if self.inner.coordinator_policy() != CoordinatorPolicy::Any {
+            let live = self.live_peer_addrs().await;
+            candidates.retain(|addr| live.contains(addr));
+        }
+
         // Filter out coordinators in cooldown (circuit-breaker).
         self.coordinator_health.filter_available(&candidates)
     }
@@ -4829,7 +4894,12 @@ impl P2pEndpoint {
         }
 
         if let Some(peer_id) = peer_id {
-            if explicit_addrs.is_empty() && self.inner.preferred_coordinator().is_none() {
+            // Refreshing dials every known peer (bootstrap seeds among them)
+            // to find a coordinator, so only the Any policy allows it.
+            if explicit_addrs.is_empty()
+                && self.inner.preferred_coordinator().is_none()
+                && self.inner.coordinator_policy() == CoordinatorPolicy::Any
+            {
                 self.refresh_runtime_known_peer_connections().await;
 
                 if let Some(conn) = self.connected_peers.read().await.get(&peer_id)
@@ -5731,7 +5801,74 @@ impl P2pEndpoint {
         if !custom_strategy_supplied && config.coordinator.is_none() {
             config.coordinator = self.coordinator_candidates().await.into_iter().next();
         }
-        if !custom_strategy_supplied && config.relay_addrs.is_empty() {
+        // The switches are authoritative, over a caller's strategy too.
+        let relay_fallback_allowed = self.inner.relay_fallback_allowed();
+        if !relay_fallback_allowed {
+            config.relay_enabled = false;
+            config.relay_addrs.clear();
+        }
+        let policy = self.inner.coordinator_policy();
+        if policy != CoordinatorPolicy::Any
+            && let Some(coordinator) = config.coordinator
+            && !self.live_peer_addrs().await.contains(&coordinator)
+        {
+            config.coordinator = None;
+        }
+        // Introducer policy: this connect's hold on an introducer, if any
+        // ([`IntroducerGuard`]).
+        let mut introducer: Option<IntroducerGuard> = None;
+        if policy == CoordinatorPolicy::Introducer {
+            // A live coordinator that is an introducer being hung up on is
+            // not used: its connection is about to close.
+            if config
+                .coordinator
+                .is_some_and(|coordinator| self.inner.introducer_is_closing(coordinator))
+            {
+                config.coordinator = None;
+            }
+            if let Some(coordinator) = config.coordinator {
+                // A live coordinator that is another connect's introducer is
+                // joined, so its hang-up waits for this connect's punch.
+                introducer = IntroducerGuard::shared(self, coordinator);
+            } else if let Some(target_peer) = peer_id.filter(|peer| !is_synthetic_peer_id(peer)) {
+                // No live coordinator: this target may use one introducer per
+                // budget, its own hints first, then known peers. One that
+                // another connect holds is joined first; one being hung up on
+                // is skipped.
+                let targets = [target_ipv4, target_ipv6];
+                let mut candidates = self.inner.introducer_hints_for(&target_peer);
+                for addr in self.runtime_known_peer_udp_addrs() {
+                    if !candidates.contains(&addr) {
+                        candidates.push(addr);
+                    }
+                }
+                candidates.retain(|addr| {
+                    !targets.contains(&Some(*addr)) && !self.inner.introducer_is_closing(*addr)
+                });
+                let choice = candidates
+                    .iter()
+                    .copied()
+                    .find(|addr| self.inner.introducer_is_held(*addr))
+                    .or_else(|| candidates.first().copied());
+                // Hold first, then spend: a hold refused (the introducer
+                // turned closing) leaves the target's budget unspent, and a
+                // spent budget releases the hold.
+                if let Some(choice) = choice
+                    && let Some(guard) = IntroducerGuard::hold(self, choice)
+                    && self.inner.spend_introducer(target_peer)
+                {
+                    info!(
+                        "Using introducer {} for {:?} (one per target per budget)",
+                        choice, target_peer
+                    );
+                    config.coordinator = Some(choice);
+                    introducer = Some(guard);
+                    #[cfg(test)]
+                    self.inner.introducer_pick_gate_for_test(target_peer).await;
+                }
+            }
+        }
+        if relay_fallback_allowed && !custom_strategy_supplied && config.relay_addrs.is_empty() {
             // Optimization: Try to find a high-quality relay from our cache first
             let target_addr = target_ipv4.or(target_ipv6);
             if let Some(addr) = target_addr {
@@ -5866,7 +6003,18 @@ impl P2pEndpoint {
             direct_addresses.push(v4);
         }
 
+        let mut punch_started = false;
         loop {
+            if punch_started
+                && introducer.is_some()
+                && !matches!(
+                    strategy.current_stage(),
+                    ConnectionStage::HolePunching { .. }
+                )
+                && let Some(guard) = introducer.take()
+            {
+                guard.finish().await;
+            }
             match strategy.current_stage().clone() {
                 ConnectionStage::DirectIPv4 { .. } => {
                     // Use Happy Eyeballs (RFC 8305) to race all direct addresses (IPv4 + IPv6)
@@ -6096,16 +6244,63 @@ impl P2pEndpoint {
                     }
                     .min(now + strategy.holepunch_timeout());
 
-                    match self
-                        .start_hole_punch_session(coordinator, target_peer_id)
-                        .await
+                    punch_started = true;
+                    let mut may_dial_coordinator = policy == CoordinatorPolicy::Any;
+                    let mut dialling_introducer = false;
+                    if policy == CoordinatorPolicy::Introducer
+                        && introducer
+                            .as_ref()
+                            .is_some_and(|guard| guard.addr == coordinator)
                     {
+                        // The first holder to reach its punch while the
+                        // introducer is not connected dials it; the others
+                        // wait for that connection, up to this stage's own
+                        // deadline. A holder left alone (its owner reached its
+                        // target directly, or is still in its direct stage)
+                        // therefore dials it itself.
+                        loop {
+                            if self.is_connected_to_addr(coordinator).await {
+                                break;
+                            }
+                            if self.inner.introducer_dial_failed(coordinator) {
+                                #[cfg(test)]
+                                self.inner.note_introducer_wait_cut_short_for_test();
+                                break;
+                            }
+                            if self.inner.claim_introducer_dial(coordinator) {
+                                may_dial_coordinator = true;
+                                dialling_introducer = true;
+                                break;
+                            }
+                            if tokio::time::Instant::now() >= stage_deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                    let started = self
+                        .start_hole_punch_session(coordinator, target_peer_id, may_dial_coordinator)
+                        .await;
+                    if dialling_introducer {
+                        self.inner.record_introducer_dial();
+                        if !self.is_connected_to_addr(coordinator).await {
+                            self.inner.mark_introducer_dial_failed(coordinator);
+                        }
+                        if let Some(stable_id) = self.connection_id_for_addr(coordinator).await {
+                            self.inner
+                                .note_introducer_connection(coordinator, stable_id);
+                        }
+                    }
+                    match started {
                         Ok(()) => match self
                             .await_hole_punch_outcome(target, target_peer_id, stage_deadline)
                             .await
                         {
                             Ok(conn) => {
                                 info!("✓ Hole-punch succeeded to {} via {}", target, coordinator);
+                                if let Some(guard) = introducer.take() {
+                                    guard.finish().await;
+                                }
                                 return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
                             }
                             Err(error) => {
@@ -6362,11 +6557,29 @@ impl P2pEndpoint {
         &self,
         coordinator: SocketAddr,
         peer_id: PeerId,
+        may_dial_coordinator: bool,
     ) -> Result<(), EndpointError> {
         if !self.is_connected_to_addr(coordinator).await {
+            // The coordinator was live when the connect chose it but has
+            // since gone (or was never live): dial it only if the policy
+            // allows this dial.
+            if !may_dial_coordinator {
+                return Err(EndpointError::Config(format!(
+                    "coordinator {coordinator} is not connected and the coordinator policy \
+                     does not allow dialling it"
+                )));
+            }
+            #[cfg(test)]
+            if self.inner.introducer_dial_fails_for_test(coordinator) {
+                return Err(EndpointError::Config(format!(
+                    "test: the dial to coordinator {coordinator} fails"
+                )));
+            }
             debug!("Connecting to coordinator {} first", coordinator);
             self.connect_direct_addr(coordinator).await?;
         }
+        #[cfg(test)]
+        self.inner.note_punch_start_for_test(coordinator);
 
         self.inner
             .initiate_nat_traversal(peer_id, coordinator)
@@ -6740,6 +6953,11 @@ impl P2pEndpoint {
         relay_addr: SocketAddr,
         hint_peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
+        if !self.inner.relay_fallback_allowed() {
+            return Err(EndpointError::Config(
+                "relay fallback is not allowed".to_string(),
+            ));
+        }
         info!(
             "Attempting MASQUE relay connection to {} via {}",
             target, relay_addr
@@ -10844,23 +11062,38 @@ impl P2pEndpoint {
 
         let endpoint = self.clone();
         let mut events = self.subscribe();
+        let mut allowed = self.inner.subscribe_proactive_relay_allowed();
         tokio::spawn(async move {
             loop {
-                let event = tokio::select! {
+                tokio::select! {
                     _ = endpoint.shutdown.cancelled() => return,
                     event = events.recv() => match event {
-                        Ok(event) => event,
+                        Ok(
+                            P2pEvent::ExternalAddressDiscovered { .. }
+                            | P2pEvent::PeerConnected { .. }
+                            | P2pEvent::BootstrapStatus { .. },
+                        ) => {}
+                        Ok(_) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     },
-                };
+                    // Turning the switch on is a trigger of its own: check
+                    // again now rather than at the next connection or address
+                    // event. Turning it off needs nothing here: the setter
+                    // has already closed the session.
+                    changed = allowed.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        if !*allowed.borrow_and_update() {
+                            continue;
+                        }
+                    }
+                }
 
-                if !matches!(
-                    event,
-                    P2pEvent::ExternalAddressDiscovered { .. }
-                        | P2pEvent::PeerConnected { .. }
-                        | P2pEvent::BootstrapStatus { .. }
-                ) {
+                // Checked before the health check, so a paused endpoint also
+                // skips the reset-and-set-up-again branch.
+                if !endpoint.inner.proactive_relay_allowed() {
                     continue;
                 }
 
@@ -10888,15 +11121,42 @@ impl P2pEndpoint {
 
                 let mut established = None;
                 for bootstrap in relay_candidates {
+                    if !endpoint.inner.proactive_relay_allowed() {
+                        break;
+                    }
                     // #305 round 2: the setup owns a fresh relay dial and its
                     // CONNECT-UDP exchange, which nothing else closes. Drop
                     // it on shutdown so it cannot keep the original socket.
+                    // Drop it too when the switch turns off mid-setup.
+                    let mut paused = endpoint.inner.subscribe_proactive_relay_allowed();
+                    let pauses_before = endpoint.inner.proactive_relay_pauses();
                     let setup = tokio::select! {
                         _ = endpoint.shutdown.cancelled() => return,
-                        setup = endpoint.inner.setup_proactive_relay(bootstrap) => setup,
+                        _ = paused.wait_for(|allowed| !*allowed) => None,
+                        setup = endpoint.inner.setup_proactive_relay(bootstrap) => Some(setup),
+                    };
+                    let Some(setup) = setup else {
+                        endpoint.inner.close_client_relay();
+                        info!(
+                            "Proactive relay setup via {} stopped: relay paused",
+                            bootstrap
+                        );
+                        break;
                     };
                     match setup {
                         Ok(relay_addr) => {
+                            // A setup that finished as the switch turned off
+                            // must not stay up. Any off while it ran counts,
+                            // even one already turned back on: the setter's
+                            // close may have ended this session's socket. The
+                            // switch coming back on is a trigger of its own,
+                            // so a fresh setup follows.
+                            if !endpoint.inner.proactive_relay_allowed()
+                                || endpoint.inner.proactive_relay_pauses() != pauses_before
+                            {
+                                endpoint.inner.close_client_relay();
+                                break;
+                            }
                             info!(
                                 "Proactive relay active at {} via bootstrap {}",
                                 relay_addr, bootstrap
@@ -10917,6 +11177,137 @@ impl P2pEndpoint {
                 }
             }
         });
+    }
+
+    /// Allow or stop proactive relay for a symmetric NAT at runtime.
+    ///
+    /// With `false`, every client relay session this endpoint holds is
+    /// closed at once: the relay address is withdrawn from the peers it was
+    /// advertised to, the shared relay endpoint is closed, and the proactive
+    /// relay manager opens no session, including through its
+    /// unhealthy-relay re-setup, until it is allowed again. A setup already
+    /// in flight is dropped, and one that completes as the switch turns off
+    /// is torn down before it is advertised. With `true` the manager checks
+    /// again at once. Allowed by default. Relay fallback dials have their
+    /// own switch, [`Self::set_relay_fallback_allowed`]. Turning this one off
+    /// still closes any session they opened.
+    pub fn set_proactive_relay_allowed(&self, allowed: bool) {
+        self.inner.set_proactive_relay_allowed(allowed);
+    }
+
+    /// Test hook (feature `test-hooks`): report a symmetric NAT and poke the
+    /// proactive relay manager, so a loopback test can make it set up a relay
+    /// through a known peer. Not for production use.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn force_symmetric_nat_for_testing(&self) {
+        self.inner.force_symmetric_nat_for_test();
+        let _ = self.event_tx.send(P2pEvent::BootstrapStatus {
+            connected: 1,
+            total: 1,
+        });
+    }
+
+    /// Whether proactive relay is allowed (see
+    /// [`Self::set_proactive_relay_allowed`]).
+    pub fn proactive_relay_allowed(&self) -> bool {
+        self.inner.proactive_relay_allowed()
+    }
+
+    /// This endpoint's client relay sessions and the bytes their relay
+    /// streams moved.
+    pub fn relay_client_stats(&self) -> crate::nat_traversal_api::RelayClientStats {
+        self.inner.relay_client_stats()
+    }
+
+    /// Allow or refuse relay fallback for connects at runtime. With `false`
+    /// the relay stage of a connect is skipped, so a connect fails once the
+    /// direct and hole-punch stages have, and no relay session is opened for
+    /// it. Allowed by default.
+    pub fn set_relay_fallback_allowed(&self, allowed: bool) {
+        self.inner.set_relay_fallback_allowed(allowed);
+    }
+
+    /// Whether relay fallback is allowed (see
+    /// [`Self::set_relay_fallback_allowed`]).
+    pub fn relay_fallback_allowed(&self) -> bool {
+        self.inner.relay_fallback_allowed()
+    }
+
+    /// Set which coordinators hole punching may use; see
+    /// [`CoordinatorPolicy`]. `Any` by default.
+    pub fn set_coordinator_policy(&self, policy: CoordinatorPolicy) {
+        self.inner.set_coordinator_policy(policy);
+    }
+
+    /// The coordinator policy (see [`Self::set_coordinator_policy`]).
+    pub fn coordinator_policy(&self) -> CoordinatorPolicy {
+        self.inner.coordinator_policy()
+    }
+
+    /// Record the introducers `peer` named for itself, tried first under
+    /// [`CoordinatorPolicy::Introducer`].
+    pub fn set_peer_introducers(&self, peer: PeerId, introducers: Vec<SocketAddr>) {
+        self.inner.set_peer_introducers(peer, introducers);
+    }
+
+    /// Let every target use one introducer again (a new burst).
+    pub fn reset_introducer_budget(&self) {
+        self.inner.reset_introducer_budget();
+    }
+
+    /// Introducer dials and the bytes they carried.
+    pub fn introducer_stats(&self) -> crate::nat_traversal_api::IntroducerStats {
+        self.inner.introducer_stats()
+    }
+
+    /// The peer and the current connection's stable id at `addr`.
+    async fn connection_at_addr(&self, addr: SocketAddr) -> Option<(PeerId, usize)> {
+        let peer = {
+            let peers = self.connected_peers.read().await;
+            peers
+                .iter()
+                .find(|(_, existing)| existing.remote_addr == TransportAddr::Udp(addr))
+                .map(|(peer_id, _)| *peer_id)
+        }?;
+        let connection = self.inner.get_connection(&peer).ok().flatten()?;
+        Some((peer, connection.stable_id()))
+    }
+
+    async fn connection_id_for_addr(&self, addr: SocketAddr) -> Option<usize> {
+        self.connection_at_addr(addr).await.map(|(_, id)| id)
+    }
+
+    /// Hang up on the introducer at `addr`: close the connection its dial
+    /// made (`connection`), counting its bytes, and no other connection to
+    /// that address. Then forget the entry.
+    async fn close_introducer(&self, addr: SocketAddr, connection: Option<usize>) {
+        #[cfg(test)]
+        self.inner.introducer_close_gate_for_test().await;
+        if let Some(ours) = connection
+            && let Some((peer, current)) = self.connection_at_addr(addr).await
+            && current == ours
+        {
+            if let Some(stats) = self.connection_transport_stats(&peer).await {
+                self.inner
+                    .record_introducer_bytes(stats.udp_tx_bytes, stats.udp_rx_bytes);
+            }
+            info!("Closing introducer connection to {} after the punch", addr);
+            #[cfg(test)]
+            self.inner.note_introducer_hangup_for_test();
+            let _ = self.disconnect(&peer).await;
+        }
+        self.inner.finish_introducer_close(addr);
+    }
+
+    /// Socket addresses of peers with a live connection.
+    async fn live_peer_addrs(&self) -> Vec<SocketAddr> {
+        let peers = self.connected_peers.read().await;
+        peers
+            .iter()
+            .filter(|(peer_id, _)| self.inner.is_peer_connected(peer_id))
+            .filter_map(|(_, existing)| existing.remote_addr.as_socket_addr())
+            .collect()
     }
 
     fn spawn_port_mapping_task(&self) {
@@ -15316,6 +15707,1109 @@ mod tests {
             "shutdown must make {held_addr} immediately bindable: {rebound:?}"
         );
 
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    // --- Proactive relay switch (`set_proactive_relay_allowed`) ---
+
+    /// A loopback relay that serves CONNECT-UDP, and a client that knows it
+    /// as its only relay candidate and is already connected to it (so the
+    /// session reuses that peer connection, as on a seed).
+    async fn relay_and_client() -> (
+        P2pEndpoint,
+        tokio::task::JoinHandle<()>,
+        SocketAddr,
+        P2pEndpoint,
+    ) {
+        let relay = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let relay_addr = localhost_addr(relay.local_addr().expect("relay addr"));
+        let relay_accept = tokio::spawn({
+            let relay = relay.clone();
+            async move { while relay.accept().await.is_some() {} }
+        });
+        let client = loopback_endpoint_with(|builder| builder.known_peer(relay_addr)).await;
+        tokio::time::timeout(Duration::from_secs(10), client.connect_addr(relay_addr))
+            .await
+            .expect("connect to relay does not time out")
+            .expect("connect to relay succeeds");
+        (relay, relay_accept, relay_addr, client)
+    }
+
+    /// What makes the manager look: a symmetric-NAT verdict and a trigger.
+    fn trigger_proactive_relay(endpoint: &P2pEndpoint) {
+        endpoint.inner.force_symmetric_nat_for_test();
+        let _ = endpoint.event_tx.send(P2pEvent::BootstrapStatus {
+            connected: 1,
+            total: 1,
+        });
+    }
+
+    fn no_client_relay(endpoint: &P2pEndpoint) -> bool {
+        endpoint.inner.relay_sessions().is_empty()
+            && endpoint.inner.relay_public_addr().is_none()
+            && !endpoint.inner.has_shared_relay_endpoint_for_test()
+    }
+
+    async fn relay_established_within(
+        events: &mut tokio::sync::broadcast::Receiver<P2pEvent>,
+        within: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(P2pEvent::RelayEstablished { .. })) => return true,
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(_)) | Err(_) => return false,
+            }
+        }
+    }
+
+    /// A paused endpoint opens no relay session on a symmetric-NAT trigger.
+    /// Turning the switch back on opens one at once, with no new event.
+    #[tokio::test]
+    async fn a_paused_endpoint_opens_no_relay_and_resuming_checks_at_once() {
+        let (relay, relay_accept, _relay_addr, client) = relay_and_client().await;
+        assert!(client.proactive_relay_allowed(), "allowed by default");
+        let mut events = client.subscribe();
+
+        client.set_proactive_relay_allowed(false);
+        trigger_proactive_relay(&client);
+        assert!(
+            !relay_established_within(&mut events, Duration::from_millis(1500)).await,
+            "a paused endpoint must not set up a relay"
+        );
+        assert!(no_client_relay(&client));
+
+        client.set_proactive_relay_allowed(true);
+        assert!(
+            relay_established_within(&mut events, Duration::from_secs(10)).await,
+            "turning the switch on must check again without a new trigger"
+        );
+        assert!(client.inner.relay_public_addr().is_some());
+
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// Turning the switch off closes an established session, withdraws the
+    /// advertised relay address from a connected peer with REMOVE_ADDRESS,
+    /// and leaves the reused peer connection to the relay up.
+    #[tokio::test]
+    async fn turning_relay_off_closes_the_session_and_withdraws_the_address() {
+        let (relay, relay_accept, _relay_addr, client) = relay_and_client().await;
+        let client_accept = tokio::spawn({
+            let client = client.clone();
+            async move { while client.accept().await.is_some() {} }
+        });
+        let client_addr = localhost_addr(client.local_addr().expect("client addr"));
+        let peer = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), peer.connect_addr(client_addr))
+            .await
+            .expect("peer connect does not time out")
+            .expect("peer connects to the client");
+        let client_id = client.peer_id();
+        let relay_id = relay.peer_id();
+        let peer_conn = || {
+            peer.inner
+                .get_connection(&client_id)
+                .ok()
+                .flatten()
+                .expect("peer holds a connection to the client")
+        };
+
+        trigger_proactive_relay(&client);
+        wait_until("the relay is active", || {
+            client.inner.relay_public_addr().is_some()
+        })
+        .await;
+        wait_until("the peer heard the relay address", || {
+            peer_conn().stats().frame_rx.add_address > 0
+        })
+        .await;
+        let removals_before = peer_conn().stats().frame_rx.remove_address;
+
+        client.set_proactive_relay_allowed(false);
+        assert!(no_client_relay(&client), "the session is closed at once");
+        assert_eq!(client.relay_client_stats().active_sessions, 0);
+        wait_until("the peer heard the relay address withdrawn", || {
+            peer_conn().stats().frame_rx.remove_address > removals_before
+        })
+        .await;
+        let to_relay = client
+            .inner
+            .get_connection(&relay_id)
+            .ok()
+            .flatten()
+            .expect("the peer connection to the relay stays");
+        assert!(to_relay.close_reason().is_none(), "and stays open");
+
+        client_accept.abort();
+        peer.shutdown().await;
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// A setup started while the switch is off is refused before it dials
+    /// anything: the relay never sees a CONNECT-UDP session.
+    #[tokio::test]
+    async fn a_setup_started_while_off_is_refused_before_it_dials() {
+        let (relay, relay_accept, relay_addr, client) = relay_and_client().await;
+        client.set_proactive_relay_allowed(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.inner.setup_proactive_relay(relay_addr),
+        )
+        .await
+        .expect("setup does not time out");
+        assert!(result.is_err(), "the setup must not succeed: {result:?}");
+        assert!(no_client_relay(&client));
+        assert_eq!(
+            relay.inner.relay_server_sessions_created_for_test(),
+            0,
+            "the relay must not see a session"
+        );
+
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// An off-then-on while a setup is in flight is a pause: the setter
+    /// closed that setup's session, so the manager's check after the setup
+    /// returns tears it down, announces nothing for it, and sets up afresh.
+    #[tokio::test]
+    async fn an_off_then_on_during_a_setup_drops_it_and_sets_up_afresh() {
+        let (relay, relay_accept, _relay_addr, client) = relay_and_client().await;
+        let mut events = client.subscribe();
+        let (reached, release) = client.inner.arm_setup_return_gate_for_test();
+        trigger_proactive_relay(&client);
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the setup reaches its return")
+            .expect("gate sender kept");
+
+        // Both flips land within one poll of the manager (this test runs on
+        // a current-thread runtime and does not yield between them), so the
+        // switch never reads off to it.
+        client.set_proactive_relay_allowed(false);
+        client.set_proactive_relay_allowed(true);
+        let _ = release.send(());
+
+        let mut established = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(P2pEvent::RelayEstablished { .. })) => established += 1,
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            established, 1,
+            "only the fresh setup may announce a relay, not the paused one"
+        );
+        assert!(client.inner.relay_public_addr().is_some());
+        assert!(client.inner.is_relay_healthy());
+        assert_eq!(client.relay_client_stats().active_sessions, 1);
+
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// The unhealthy-relay reset withdraws the relay address it forgets.
+    #[tokio::test]
+    async fn the_unhealthy_reset_withdraws_the_old_relay_address() {
+        let (relay, relay_accept, _relay_addr, client) = relay_and_client().await;
+        let client_accept = tokio::spawn({
+            let client = client.clone();
+            async move { while client.accept().await.is_some() {} }
+        });
+        let client_addr = localhost_addr(client.local_addr().expect("client addr"));
+        let peer = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), peer.connect_addr(client_addr))
+            .await
+            .expect("peer connect does not time out")
+            .expect("peer connects to the client");
+        let client_id = client.peer_id();
+        let peer_conn = || {
+            peer.inner
+                .get_connection(&client_id)
+                .ok()
+                .flatten()
+                .expect("peer holds a connection to the client")
+        };
+        trigger_proactive_relay(&client);
+        wait_until("the peer heard the relay address", || {
+            peer_conn().stats().frame_rx.add_address > 0
+        })
+        .await;
+        let removals_before = peer_conn().stats().frame_rx.remove_address;
+
+        client.inner.reset_relay_state();
+        wait_until("the peer heard the old relay address withdrawn", || {
+            peer_conn().stats().frame_rx.remove_address > removals_before
+        })
+        .await;
+
+        client_accept.abort();
+        peer.shutdown().await;
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// `relay_servers` lists only open sessions, as `active_sessions` counts.
+    #[tokio::test]
+    async fn relay_servers_lists_only_open_sessions() {
+        let (relay, relay_accept, _relay_addr, client) = relay_and_client().await;
+        trigger_proactive_relay(&client);
+        wait_until("the relay is active", || {
+            client.relay_client_stats().active_sessions == 1
+        })
+        .await;
+        let sessions = client.inner.relay_sessions();
+        let connection = sessions
+            .iter()
+            .next()
+            .map(|entry| entry.value().connection.clone())
+            .expect("a session");
+        connection.close(crate::VarInt::from_u32(0), b"test");
+        wait_until("the session reads closed", || {
+            client.relay_client_stats().active_sessions == 0
+        })
+        .await;
+        assert!(
+            !sessions.is_empty(),
+            "the closed session is still in the map"
+        );
+        assert!(
+            client.relay_client_stats().relay_servers.is_empty(),
+            "a closed session is not listed"
+        );
+
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// A loopback endpoint that counts every inbound connection it accepts,
+    /// so a test sees a connection that opened and closed during a dial.
+    async fn counting_endpoint() -> (
+        P2pEndpoint,
+        SocketAddr,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let endpoint = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let addr = localhost_addr(endpoint.local_addr().expect("endpoint addr"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let endpoint = endpoint.clone();
+            let accepted = Arc::clone(&accepted);
+            async move {
+                while endpoint.accept().await.is_some() {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        (endpoint, addr, accepted, task)
+    }
+
+    fn silent_target() -> (std::net::UdpSocket, SocketAddr) {
+        let silent = std::net::UdpSocket::bind(loopback_ephemeral_addr()).expect("bind silent");
+        let addr = silent.local_addr().expect("silent addr");
+        (silent, addr)
+    }
+
+    async fn connect_unreachable(client: &P2pEndpoint, target: PeerId, addr: SocketAddr) {
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            client.connect_with_fallback(Some(addr), None, None, Some(target)),
+        )
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "the unreachable target cannot connect"
+        );
+    }
+
+    /// A resting endpoint (relay fallback off, `ConnectedOnly`) never
+    /// contacts the known seed on a connect to an unreachable target: no
+    /// relay stage, no coordinator dial, no known-peer refresh. The seed's
+    /// accept count is cumulative, so a connection that opened and closed
+    /// during the dial would show.
+    #[tokio::test]
+    async fn a_resting_connect_never_contacts_the_seed() {
+        let (seed, seed_addr, seed_accepts, seed_task) = counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder.known_peer(seed_addr)).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::ConnectedOnly);
+        assert!(!client.relay_fallback_allowed());
+
+        // A peer-id-only connect to a peer with no known address does not
+        // refresh (dial) the known peers to find a coordinator.
+        let unknown = PeerId([0x7f; 32]);
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.connect_peer(unknown)).await;
+        assert_eq!(
+            seed_accepts.load(Ordering::SeqCst),
+            0,
+            "no known-peer refresh"
+        );
+
+        let (silent, silent_addr) = silent_target();
+        let target = PeerId([0x7c; 32]);
+        connect_unreachable(&client, target, silent_addr).await;
+
+        assert_eq!(
+            seed_accepts.load(Ordering::SeqCst),
+            0,
+            "the seed never heard from us"
+        );
+        assert_eq!(seed.inner.relay_server_sessions_created_for_test(), 0);
+        assert_eq!(client.relay_client_stats().active_sessions, 0);
+        assert_eq!(client.introducer_stats().dials, 0, "no introducer at rest");
+
+        // A relay attempt made directly is refused too.
+        let refused = client
+            .try_relay_connection(silent_addr, seed_addr, Some(target))
+            .await;
+        assert!(refused.is_err());
+        assert_eq!(seed_accepts.load(Ordering::SeqCst), 0);
+        assert_eq!(seed.inner.relay_server_sessions_created_for_test(), 0);
+
+        drop(silent);
+        client.shutdown().await;
+        seed.shutdown().await;
+        seed_task.abort();
+    }
+
+    /// A burst (`Introducer`, relay fallback off) to a target that needs a
+    /// punch uses exactly one introducer, the one the target named for
+    /// itself rather than the seed, hangs up on it once the punch resolves,
+    /// and counts its bytes. A second connect to the same target in the same
+    /// budget dials no introducer; relay fallback is never used.
+    #[tokio::test]
+    async fn a_burst_uses_one_introducer_per_target_and_hangs_up() {
+        let (seed, seed_addr, seed_accepts, seed_task) = counting_endpoint().await;
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder.known_peer(seed_addr)).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let target = PeerId([0x7d; 32]);
+        client.set_peer_introducers(target, vec![introducer_addr]);
+
+        let (silent, silent_addr) = silent_target();
+        connect_unreachable(&client, target, silent_addr).await;
+
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            1,
+            "one introducer dial"
+        );
+        assert_eq!(
+            seed_accepts.load(Ordering::SeqCst),
+            0,
+            "the target's own hint came first"
+        );
+        let stats = client.introducer_stats();
+        assert_eq!(stats.dials, 1);
+        assert!(
+            stats.bytes_sent > 0 && stats.bytes_received > 0,
+            "{stats:?}"
+        );
+        let introducer_id = introducer.peer_id();
+        wait_until("the introducer connection is closed", || {
+            client
+                .inner
+                .get_connection(&introducer_id)
+                .ok()
+                .flatten()
+                .is_none_or(|connection| connection.close_reason().is_some())
+        })
+        .await;
+        assert_eq!(introducer.inner.relay_server_sessions_created_for_test(), 0);
+        assert_eq!(client.relay_client_stats().active_sessions, 0);
+
+        connect_unreachable(&client, target, silent_addr).await;
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            1,
+            "the budget is spent"
+        );
+        assert_eq!(seed_accepts.load(Ordering::SeqCst), 0);
+        assert_eq!(client.introducer_stats().dials, 1);
+
+        // A new budget (the next burst) may use one again.
+        client.reset_introducer_budget();
+        connect_unreachable(&client, target, silent_addr).await;
+        assert_eq!(introducer_accepts.load(Ordering::SeqCst), 2);
+        assert_eq!(client.introducer_stats().dials, 2);
+
+        drop(silent);
+        client.shutdown().await;
+        introducer.shutdown().await;
+        introducer_task.abort();
+        seed.shutdown().await;
+        seed_task.abort();
+    }
+
+    /// L-16: a peer-id-only connect under `ConnectedOnly` or `Introducer`
+    /// does not refresh (dial) the known peers. With the seed removed from
+    /// the bootstrap nodes, `preferred_coordinator()` is `None`, so the
+    /// refresh gate is the only thing between the connect and the seed.
+    #[tokio::test]
+    async fn a_peer_id_only_connect_does_not_dial_the_known_peers() {
+        let (seed, seed_addr, seed_accepts, seed_task) = counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder.known_peer(seed_addr)).await;
+        client
+            .inner
+            .remove_bootstrap_node(seed_addr)
+            .expect("remove the seed from the bootstrap nodes");
+        assert!(client.inner.preferred_coordinator().is_none());
+        assert!(client.runtime_known_peer_udp_addrs().contains(&seed_addr));
+        client.set_relay_fallback_allowed(false);
+
+        for (policy, peer) in [
+            (CoordinatorPolicy::ConnectedOnly, PeerId([0x61; 32])),
+            (CoordinatorPolicy::Introducer, PeerId([0x62; 32])),
+        ] {
+            client.set_coordinator_policy(policy);
+            let _ = tokio::time::timeout(Duration::from_secs(20), client.connect_peer(peer)).await;
+            assert_eq!(
+                seed_accepts.load(Ordering::SeqCst),
+                0,
+                "{policy:?}: a peer-id-only connect must not dial the known peers"
+            );
+        }
+
+        client.shutdown().await;
+        seed.shutdown().await;
+        seed_task.abort();
+    }
+
+    /// L-17: two concurrent burst connects that need the same introducer
+    /// share one connection to it. The second takes a reference on the
+    /// introducer the first opened, so the first's hang-up waits for the
+    /// second's punch: the introducer is dialled once, both targets are
+    /// punched through it, and it is hung up on once, after the last punch.
+    #[tokio::test]
+    async fn concurrent_burst_connects_share_one_introducer() {
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let first = PeerId([0x63; 32]);
+        let second = PeerId([0x64; 32]);
+        client.set_peer_introducers(first, vec![introducer_addr]);
+        client.set_peer_introducers(second, vec![introducer_addr]);
+        // Both addresses blackhole, so both connects reach their punch after
+        // the same direct stage. The introducer rejects each coordination
+        // at once, so the first punch resolves before the second starts.
+        let (silent_first, first_addr) = silent_target();
+        let (silent_second, second_addr) = silent_target();
+
+        let first_dial = tokio::spawn({
+            let client = client.clone();
+            async move { connect_unreachable(&client, first, first_addr).await }
+        });
+        let second_dial = tokio::spawn({
+            let client = client.clone();
+            async move { connect_unreachable(&client, second, second_addr).await }
+        });
+        first_dial.await.expect("first dial");
+        second_dial.await.expect("second dial");
+
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            1,
+            "one introducer contact"
+        );
+        assert_eq!(client.introducer_stats().dials, 1);
+        assert_eq!(
+            client.inner.punch_starts_via_for_test(introducer_addr),
+            2,
+            "both targets were punched through the shared introducer"
+        );
+        let introducer_id = introducer.peer_id();
+        wait_until("the introducer connection is closed", || {
+            client
+                .inner
+                .get_connection(&introducer_id)
+                .ok()
+                .flatten()
+                .is_none_or(|connection| connection.close_reason().is_some())
+        })
+        .await;
+        assert_eq!(client.inner.introducer_hangups_for_test(), 1, "one hang-up");
+
+        drop((silent_first, silent_second));
+        client.shutdown().await;
+        introducer.shutdown().await;
+        introducer_task.abort();
+    }
+
+    /// Two connects holding the same introducer, with the first parked just
+    /// after it took the introducer. Returns once both hold it.
+    async fn two_holders(
+        client: &P2pEndpoint,
+        introducer_addr: SocketAddr,
+        owner: (PeerId, SocketAddr),
+        sharer: (PeerId, SocketAddr),
+    ) -> (
+        tokio::task::JoinHandle<Result<(PeerConnection, ConnectionMethod), EndpointError>>,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        client.set_peer_introducers(owner.0, vec![introducer_addr]);
+        client.set_peer_introducers(sharer.0, vec![introducer_addr]);
+        let (reached, release) = client.inner.arm_introducer_pick_gate_for_test(owner.0);
+        let owner_dial = tokio::spawn({
+            let client = client.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    client.connect_with_fallback(Some(owner.1), None, None, Some(owner.0)),
+                )
+                .await
+                .unwrap_or(Err(EndpointError::Timeout))
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the owner takes the introducer")
+            .expect("gate sender kept");
+        let sharer_dial = tokio::spawn({
+            let client = client.clone();
+            async move { connect_unreachable(&client, sharer.0, sharer.1).await }
+        });
+        wait_until("the sharer holds the introducer too", || {
+            client.inner.introducer_holders_for_test(introducer_addr) == 2
+        })
+        .await;
+        (owner_dial, sharer_dial, release)
+    }
+
+    /// L-19: the owner of an introducer reaches its own target directly and
+    /// never dials the introducer. The sharer, left as the only holder, dials
+    /// it itself and gets its punch.
+    #[tokio::test]
+    async fn a_sharer_dials_the_introducer_when_its_owner_needs_none() {
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let (reachable, reachable_addr, _reachable_accepts, reachable_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let (silent, silent_addr) = silent_target();
+        let sharer = PeerId([0x65; 32]);
+
+        let (owner_dial, sharer_dial, release) = two_holders(
+            &client,
+            introducer_addr,
+            (reachable.peer_id(), reachable_addr),
+            (sharer, silent_addr),
+        )
+        .await;
+        let _ = release.send(());
+        let owner_result = owner_dial.await.expect("owner dial");
+        assert!(
+            owner_result.is_ok(),
+            "the owner reaches its target directly"
+        );
+        sharer_dial.await.expect("sharer dial");
+
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            1,
+            "one introducer contact"
+        );
+        assert_eq!(
+            client.inner.punch_starts_via_for_test(introducer_addr),
+            1,
+            "the sharer punched through the introducer it dialled"
+        );
+        assert_eq!(client.introducer_stats().dials, 1);
+
+        drop(silent);
+        client.shutdown().await;
+        reachable.shutdown().await;
+        reachable_task.abort();
+        introducer.shutdown().await;
+        introducer_task.abort();
+    }
+
+    /// L-19: the owner of an introducer is still in its direct stage when
+    /// the sharer reaches its punch. The sharer dials the introducer and
+    /// punches; the owner later punches through the same connection.
+    #[tokio::test]
+    async fn a_sharer_is_not_stranded_by_a_slow_owner() {
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let (silent_owner, owner_addr) = silent_target();
+        let (silent_sharer, sharer_addr) = silent_target();
+        let owner = PeerId([0x66; 32]);
+        let sharer = PeerId([0x67; 32]);
+
+        let (owner_dial, sharer_dial, release) = two_holders(
+            &client,
+            introducer_addr,
+            (owner, owner_addr),
+            (sharer, sharer_addr),
+        )
+        .await;
+        // The owner stays parked (a long direct stage) until the sharer has
+        // punched.
+        sharer_dial.await.expect("sharer dial");
+        assert_eq!(
+            client.inner.punch_starts_via_for_test(introducer_addr),
+            1,
+            "the sharer punched while the owner was still in its direct stage"
+        );
+        let _ = release.send(());
+        let _ = owner_dial.await.expect("owner dial");
+
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            1,
+            "one introducer contact"
+        );
+        assert_eq!(client.inner.punch_starts_via_for_test(introducer_addr), 2);
+        assert_eq!(client.introducer_stats().dials, 1);
+        let introducer_id = introducer.peer_id();
+        wait_until("the introducer connection is closed", || {
+            client
+                .inner
+                .get_connection(&introducer_id)
+                .ok()
+                .flatten()
+                .is_none_or(|connection| connection.close_reason().is_some())
+        })
+        .await;
+        assert_eq!(client.inner.introducer_hangups_for_test(), 1);
+
+        drop((silent_owner, silent_sharer));
+        client.shutdown().await;
+        introducer.shutdown().await;
+        introducer_task.abort();
+    }
+
+    /// L-20: while the last holder hangs up on an introducer, a connect that
+    /// starts in that window neither joins it nor uses its connection; once
+    /// the close has finished, it may open the introducer afresh.
+    #[tokio::test]
+    async fn a_closing_introducer_is_not_used() {
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let first = PeerId([0x68; 32]);
+        let second = PeerId([0x69; 32]);
+        client.set_peer_introducers(first, vec![introducer_addr]);
+        client.set_peer_introducers(second, vec![introducer_addr]);
+        let (silent_first, first_addr) = silent_target();
+        let (silent_second, second_addr) = silent_target();
+
+        let (closing, release_close) = client.inner.arm_introducer_close_gate_for_test();
+        let first_dial = tokio::spawn({
+            let client = client.clone();
+            async move { connect_unreachable(&client, first, first_addr).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), closing)
+            .await
+            .expect("the hang-up starts")
+            .expect("gate sender kept");
+        assert!(client.inner.introducer_is_closing(introducer_addr));
+        assert!(
+            client.is_connected_to_addr(introducer_addr).await,
+            "still up while closing"
+        );
+
+        connect_unreachable(&client, second, second_addr).await;
+        assert_eq!(
+            client.inner.punch_starts_via_for_test(introducer_addr),
+            1,
+            "the closing connection was not used"
+        );
+
+        let _ = release_close.send(());
+        first_dial.await.expect("first dial");
+        wait_until("the close finished", || {
+            !client.inner.introducer_is_closing(introducer_addr)
+        })
+        .await;
+        connect_unreachable(&client, second, second_addr).await;
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            2,
+            "a fresh introducer dial"
+        );
+        assert_eq!(client.inner.punch_starts_via_for_test(introducer_addr), 2);
+
+        drop((silent_first, silent_second));
+        client.shutdown().await;
+        introducer.shutdown().await;
+        introducer_task.abort();
+    }
+
+    /// L-20: the hang-up closes only the connection the introducer dial
+    /// made. A fresh connection to the same address, opened while the close
+    /// was pending, stays up.
+    #[tokio::test]
+    async fn a_fresh_connection_to_the_introducer_is_not_closed() {
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let target = PeerId([0x6a; 32]);
+        client.set_peer_introducers(target, vec![introducer_addr]);
+        let (silent, silent_addr) = silent_target();
+
+        let (closing, release_close) = client.inner.arm_introducer_close_gate_for_test();
+        let dial = tokio::spawn({
+            let client = client.clone();
+            async move { connect_unreachable(&client, target, silent_addr).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), closing)
+            .await
+            .expect("the hang-up starts")
+            .expect("gate sender kept");
+
+        // The introducer drops the old connection, and the client opens a
+        // fresh one to the same address before the pending close runs.
+        let _ = introducer.disconnect(&client.peer_id()).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.is_connected_to_addr(introducer_addr).await {
+            assert!(Instant::now() < deadline, "the old connection is gone");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.connect_addr(introducer_addr),
+        )
+        .await
+        .expect("fresh connect does not time out")
+        .expect("fresh connect");
+        wait_until("the introducer accepted the fresh connection", || {
+            introducer_accepts.load(Ordering::SeqCst) == 2
+        })
+        .await;
+
+        let _ = release_close.send(());
+        dial.await.expect("dial");
+        wait_until("the close finished", || {
+            !client.inner.introducer_is_closing(introducer_addr)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            client.is_connected_to_addr(introducer_addr).await,
+            "the fresh connection must not be closed"
+        );
+        assert_eq!(client.inner.introducer_hangups_for_test(), 0);
+
+        drop(silent);
+        client.shutdown().await;
+        introducer.shutdown().await;
+        introducer_task.abort();
+    }
+
+    /// L-21: a refused introducer hold (it turned closing after the
+    /// candidate filter) leaves the target's budget unspent, so the next
+    /// connect in the same budget can still use the introducer.
+    #[tokio::test]
+    async fn a_refused_introducer_hold_leaves_the_budget_unspent() {
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let target = PeerId([0x6b; 32]);
+        client.set_peer_introducers(target, vec![introducer_addr]);
+        let (silent, silent_addr) = silent_target();
+
+        client
+            .inner
+            .fail_next_introducer_hold_for_test(introducer_addr);
+        connect_unreachable(&client, target, silent_addr).await;
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            0,
+            "the hold was refused"
+        );
+
+        connect_unreachable(&client, target, silent_addr).await;
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            1,
+            "the budget was not spent by the refused hold"
+        );
+
+        drop(silent);
+        client.shutdown().await;
+        introducer.shutdown().await;
+        introducer_task.abort();
+    }
+
+    /// L-21: when the single introducer dial fails, the other holder stops
+    /// waiting at once instead of polling to its stage deadline.
+    #[tokio::test]
+    async fn waiters_stop_at_once_when_the_introducer_dial_fails() {
+        let (introducer, introducer_addr, introducer_accepts, introducer_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        client.inner.fail_introducer_dials_for_test(introducer_addr);
+        let (silent_owner, owner_addr) = silent_target();
+        let (silent_sharer, sharer_addr) = silent_target();
+
+        let (owner_dial, sharer_dial, release) = two_holders(
+            &client,
+            introducer_addr,
+            (PeerId([0x6c; 32]), owner_addr),
+            (PeerId([0x6d; 32]), sharer_addr),
+        )
+        .await;
+        let _ = release.send(());
+        let _ = owner_dial.await.expect("owner dial");
+        sharer_dial.await.expect("sharer dial");
+
+        assert_eq!(
+            introducer_accepts.load(Ordering::SeqCst),
+            0,
+            "the dial failed"
+        );
+        assert_eq!(
+            client.inner.introducer_waits_cut_short_for_test(),
+            1,
+            "the other holder stopped as soon as the dial failed"
+        );
+        assert_eq!(client.introducer_stats().dials, 1, "still a single dial");
+
+        drop((silent_owner, silent_sharer));
+        client.shutdown().await;
+        introducer.shutdown().await;
+        introducer_task.abort();
+    }
+
+    /// L-14: a coordinator that was live when the connect chose it, and
+    /// whose connection closed before the hole-punch stage, is not dialled
+    /// again under `ConnectedOnly`.
+    #[tokio::test]
+    async fn a_coordinator_lost_before_the_punch_is_not_redialled() {
+        let (coordinator, coordinator_addr, coordinator_accepts, coordinator_task) =
+            counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.connect_addr(coordinator_addr),
+        )
+        .await
+        .expect("connect to the coordinator does not time out")
+        .expect("connect to the coordinator");
+        wait_until("the coordinator accepted", || {
+            coordinator_accepts.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::ConnectedOnly);
+
+        let (silent, silent_addr) = silent_target();
+        let target = PeerId([0x7e; 32]);
+        let dial = tokio::spawn({
+            let client = client.clone();
+            async move { connect_unreachable(&client, target, silent_addr).await }
+        });
+        // The connect picked the live coordinator; drop that connection
+        // while the direct stage still runs.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = coordinator.disconnect(&client.peer_id()).await;
+        dial.await.expect("dial task");
+
+        assert_eq!(
+            coordinator_accepts.load(Ordering::SeqCst),
+            1,
+            "the lost coordinator must not be dialled again"
+        );
+
+        drop(silent);
+        client.shutdown().await;
+        coordinator.shutdown().await;
+        coordinator_task.abort();
+    }
+
+    /// With `ConnectedOnly`, only a live peer can coordinate.
+    #[tokio::test]
+    async fn coordinators_are_live_peers_only_when_unconnected_ones_are_off() {
+        let (relay, relay_accept, relay_addr, client) = relay_and_client().await;
+        let hinted: SocketAddr = "127.0.0.1:9000".parse().expect("addr");
+        client
+            .upsert_peer_hints(
+                PeerId([0x5b; 32]),
+                vec![hinted],
+                Some(PeerCapabilities {
+                    supports_coordination: true,
+                    ..PeerCapabilities::default()
+                }),
+            )
+            .await;
+        assert!(client.coordinator_candidates().await.contains(&hinted));
+
+        client.set_coordinator_policy(CoordinatorPolicy::ConnectedOnly);
+        let candidates = client.coordinator_candidates().await;
+        assert!(
+            !candidates.contains(&hinted),
+            "an unconnected hint is dropped"
+        );
+        assert!(
+            candidates.contains(&crate::shared::normalize_socket_addr(relay_addr))
+                || candidates.contains(&relay_addr),
+            "the live peer may still coordinate: {candidates:?}"
+        );
+
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// A setup in flight when the switch turns off is dropped: the relay
+    /// never answers here, so only the switch can end it.
+    #[tokio::test]
+    async fn a_setup_in_flight_is_dropped_when_the_switch_turns_off() {
+        let mute_relay = crate::nat_traversal_api::NatTraversalEndpoint::new(
+            crate::nat_traversal_api::NatTraversalConfig {
+                bind_addr: Some(loopback_ephemeral_addr()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("mute relay binds");
+        let mute_quic = mute_relay.get_endpoint().expect("mute relay endpoint");
+        let relay_addr = mute_quic.local_addr().expect("mute relay address");
+        let client = loopback_endpoint_with(|builder| builder.known_peer(relay_addr)).await;
+        let mut events = client.subscribe();
+
+        trigger_proactive_relay(&client);
+        wait_until("the relay handshake completes", || {
+            mute_relay
+                .list_connections()
+                .map(|connections| !connections.is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        client.set_proactive_relay_allowed(false);
+        wait_until("the dropped setup closes its relay connection", || {
+            mute_relay
+                .list_connections()
+                .map(|connections| connections.is_empty())
+                .unwrap_or(false)
+                || mute_quic.open_connections() == 0
+        })
+        .await;
+        assert!(!relay_established_within(&mut events, Duration::from_millis(500)).await);
+        assert!(no_client_relay(&client));
+
+        client.shutdown().await;
+        mute_relay.shutdown().await.expect("mute relay shutdown");
+    }
+
+    /// The manager's "relay unhealthy, reset and set up again" branch obeys
+    /// the switch; turning it on lets that branch run.
+    #[tokio::test]
+    async fn the_unhealthy_relay_resetup_obeys_the_switch() {
+        let (relay, relay_accept, _relay_addr, client) = relay_and_client().await;
+        client.set_proactive_relay_allowed(false);
+        // An advertised relay address with no live session: unhealthy.
+        let stale: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        client.inner.set_test_relay_public_addr(stale);
+        assert!(!client.inner.is_relay_healthy());
+
+        trigger_proactive_relay(&client);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            client.inner.relay_public_addr(),
+            Some(stale),
+            "paused: no reset and no new setup"
+        );
+        assert!(client.inner.relay_sessions().is_empty());
+
+        client.set_proactive_relay_allowed(true);
+        wait_until("the relay is set up again", || {
+            client
+                .inner
+                .relay_public_addr()
+                .is_some_and(|addr| addr != stale)
+        })
+        .await;
+
+        client.shutdown().await;
+        relay.shutdown().await;
+        relay_accept.abort();
+    }
+
+    /// `relay_client_stats` reports the session and the bytes its relay
+    /// stream moves, and keeps the byte totals after the session closes.
+    #[tokio::test]
+    async fn relay_client_stats_count_the_session_and_its_bytes() {
+        let (relay, relay_accept, relay_addr, client) = relay_and_client().await;
+        assert_eq!(
+            client.relay_client_stats(),
+            crate::RelayClientStats::default()
+        );
+        trigger_proactive_relay(&client);
+        wait_until("the relay is active", || {
+            client.inner.relay_public_addr().is_some()
+        })
+        .await;
+        let stats = client.relay_client_stats();
+        assert_eq!(stats.active_sessions, 1);
+        assert_eq!(
+            stats.relay_servers,
+            vec![crate::shared::normalize_socket_addr(relay_addr)]
+        );
+        let public = stats.relay_public_addr.expect("relay public address");
+
+        // A dial to the relayed address crosses the client's relay stream.
+        let dialer = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let dial = tokio::spawn({
+            let dialer = dialer.clone();
+            async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), dialer.connect_addr(public))
+                    .await;
+            }
+        });
+        wait_until("relayed bytes are counted both ways", || {
+            let stats = client.relay_client_stats();
+            stats.bytes_received > 0 && stats.bytes_sent > 0
+        })
+        .await;
+        let moved = client.relay_client_stats();
+
+        client.set_proactive_relay_allowed(false);
+        let after = client.relay_client_stats();
+        assert_eq!(after.active_sessions, 0);
+        assert!(after.relay_servers.is_empty());
+        assert!(after.bytes_sent >= moved.bytes_sent);
+        assert!(after.bytes_received >= moved.bytes_received);
+
+        dial.abort();
+        dialer.shutdown().await;
+        client.shutdown().await;
         relay.shutdown().await;
         relay_accept.abort();
     }

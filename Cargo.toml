@@ -70,6 +70,10 @@ __qlog = ["dep:qlog"]
 # Zero-cost tracing system
 trace = []
 
+# Test hooks for embedders' own tests (forces the symmetric-NAT verdict so
+# the proactive relay manager runs on loopback). Never enable in production.
+test-hooks = []
+
 # BLE transport support (Linux, macOS, Windows) — opt-in on all platforms
 # until macOS app-bundle packaging is solved (issue #177,
 # docs/adr/ADR-010-ble-transport-opt-in.md).

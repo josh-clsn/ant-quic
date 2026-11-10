@@ -535,6 +535,68 @@ impl Node {
         &self.inner
     }
 
+    /// Allow or stop proactive relay for a symmetric NAT at runtime. See
+    /// [`P2pEndpoint::set_proactive_relay_allowed`].
+    pub fn set_proactive_relay_allowed(&self, allowed: bool) {
+        self.inner.set_proactive_relay_allowed(allowed);
+    }
+
+    /// Test hook (feature `test-hooks`); see
+    /// [`P2pEndpoint::force_symmetric_nat_for_testing`].
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn force_symmetric_nat_for_testing(&self) {
+        self.inner.force_symmetric_nat_for_testing();
+    }
+
+    /// Whether proactive relay is allowed.
+    pub fn proactive_relay_allowed(&self) -> bool {
+        self.inner.proactive_relay_allowed()
+    }
+
+    /// This node's client relay sessions and the bytes they moved.
+    pub fn relay_client_stats(&self) -> crate::RelayClientStats {
+        self.inner.relay_client_stats()
+    }
+
+    /// Allow or refuse relay fallback for connects at runtime. See
+    /// [`P2pEndpoint::set_relay_fallback_allowed`].
+    pub fn set_relay_fallback_allowed(&self, allowed: bool) {
+        self.inner.set_relay_fallback_allowed(allowed);
+    }
+
+    /// Whether relay fallback is allowed.
+    pub fn relay_fallback_allowed(&self) -> bool {
+        self.inner.relay_fallback_allowed()
+    }
+
+    /// Set which coordinators hole punching may use. See
+    /// [`crate::CoordinatorPolicy`].
+    pub fn set_coordinator_policy(&self, policy: crate::CoordinatorPolicy) {
+        self.inner.set_coordinator_policy(policy);
+    }
+
+    /// The coordinator policy.
+    pub fn coordinator_policy(&self) -> crate::CoordinatorPolicy {
+        self.inner.coordinator_policy()
+    }
+
+    /// Record the introducers `peer` named for itself. See
+    /// [`P2pEndpoint::set_peer_introducers`].
+    pub fn set_peer_introducers(&self, peer: PeerId, introducers: Vec<SocketAddr>) {
+        self.inner.set_peer_introducers(peer, introducers);
+    }
+
+    /// Let every target use one introducer again (a new burst).
+    pub fn reset_introducer_budget(&self) {
+        self.inner.reset_introducer_budget();
+    }
+
+    /// Introducer dials and the bytes they carried.
+    pub fn introducer_stats(&self) -> crate::IntroducerStats {
+        self.inner.introducer_stats()
+    }
+
     /// The node's bootstrap peer cache.
     ///
     /// This is the single cache instance the endpoint uses for

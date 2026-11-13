@@ -604,6 +604,16 @@ impl Node {
         self.inner.reset_introducer_budget();
     }
 
+    /// Mark the embedder's own peers. See [`P2pEndpoint::set_own_peers`].
+    pub fn set_own_peers(&self, peers: Vec<PeerId>) {
+        self.inner.set_own_peers(peers);
+    }
+
+    /// The peers marked as the embedder's own.
+    pub fn own_peers(&self) -> Vec<PeerId> {
+        self.inner.own_peers()
+    }
+
     /// Introducer dials and the bytes they carried.
     pub fn introducer_stats(&self) -> crate::IntroducerStats {
         self.inner.introducer_stats()

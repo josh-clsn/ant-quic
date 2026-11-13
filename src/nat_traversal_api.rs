@@ -1558,6 +1558,8 @@ pub struct RelaySession {
 const MAX_INTRODUCER_HINT_PEERS: usize = 4096;
 /// Bound on the introducers kept per target.
 const MAX_INTRODUCERS_PER_PEER: usize = 8;
+/// How many own peers [`NatTraversalEndpoint::set_own_peers`] keeps.
+const MAX_OWN_PEERS: usize = 256;
 
 /// Which coordinators hole punching may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1826,6 +1828,10 @@ pub struct NatTraversalEndpoint {
     /// Targets that used their one introducer since the last
     /// [`NatTraversalEndpoint::reset_introducer_budget`].
     introducer_spent: ParkingMutex<HashSet<PeerId>>,
+    /// The embedder's own peers ([`NatTraversalEndpoint::set_own_peers`]):
+    /// under [`CoordinatorPolicy::Introducer`] a live peer may coordinate
+    /// any dial only when it is one of these.
+    own_peers: ParkingMutex<HashSet<PeerId>>,
     introducer_dials: AtomicU64,
     /// Open introducers by address ([`IntroducerEntry`]).
     introducer_refs: ParkingMutex<HashMap<SocketAddr, IntroducerEntry>>,
@@ -3260,6 +3266,7 @@ impl NatTraversalEndpoint {
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
             introducer_hints: ParkingMutex::new(HashMap::new()),
             introducer_spent: ParkingMutex::new(HashSet::new()),
+            own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
             introducer_refs: ParkingMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -3819,6 +3826,7 @@ impl NatTraversalEndpoint {
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
             introducer_hints: ParkingMutex::new(HashMap::new()),
             introducer_spent: ParkingMutex::new(HashSet::new()),
+            own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
             introducer_refs: ParkingMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -8165,6 +8173,27 @@ impl NatTraversalEndpoint {
     /// Let every target use one introducer again (a new burst).
     pub fn reset_introducer_budget(&self) {
         self.introducer_spent.lock().clear();
+    }
+
+    /// Mark the peers that are the embedder's own (for example the other
+    /// devices of the same account), replacing the previous list. Under
+    /// [`CoordinatorPolicy::Introducer`] a live peer may coordinate a dial
+    /// only when it is one of these, or when the target named it for itself
+    /// ([`Self::set_peer_introducers`]); any other live peer is never told
+    /// whom this endpoint is dialling. An empty list clears it.
+    pub fn set_own_peers(&self, peers: Vec<PeerId>) {
+        let mut own = self.own_peers.lock();
+        own.clear();
+        own.extend(peers.into_iter().take(MAX_OWN_PEERS));
+    }
+
+    /// The peers marked as the embedder's own ([`Self::set_own_peers`]).
+    pub fn own_peers(&self) -> Vec<PeerId> {
+        self.own_peers.lock().iter().copied().collect()
+    }
+
+    pub(crate) fn is_own_peer(&self, peer: &PeerId) -> bool {
+        self.own_peers.lock().contains(peer)
     }
 
     /// Spend `peer`'s one introducer for this budget. Returns false when it

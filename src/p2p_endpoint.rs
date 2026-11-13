@@ -5816,21 +5816,19 @@ impl P2pEndpoint {
         {
             config.coordinator = None;
         }
-        // Introducer policy: this connect's hold on an introducer, if any
-        // ([`IntroducerGuard`]).
-        let mut introducer: Option<IntroducerGuard> = None;
-        if policy == CoordinatorPolicy::Introducer {
-            // A coordination request names the target, so a live peer
-            // coordinates only when it is the embedder's own or the target
-            // named it for itself; any other would learn whom this node is
-            // dialling. An own peer is preferred.
+        // A coordination request names the target, so under any policy but
+        // `Any` a live peer coordinates only when it is the embedder's own or
+        // the target named it for itself; any other would learn whom this
+        // node is dialling. An own peer is preferred. Under `ConnectedOnly`
+        // with neither, the connect ends after its direct stage.
+        if policy != CoordinatorPolicy::Any {
             let named = peer_id
                 .filter(|peer| !is_synthetic_peer_id(peer))
                 .map(|peer| self.inner.introducer_hints_for(&peer))
                 .unwrap_or_default();
             if let Some(coordinator) = config.coordinator
                 && self
-                    .burst_coordinator_rank(coordinator, &named)
+                    .own_or_named_coordinator_rank(coordinator, &named)
                     .await
                     .is_none()
             {
@@ -5839,7 +5837,7 @@ impl P2pEndpoint {
             if config.coordinator.is_none() && !custom_strategy_supplied {
                 let mut best: Option<(u8, SocketAddr)> = None;
                 for addr in self.coordinator_candidates().await {
-                    if let Some(rank) = self.burst_coordinator_rank(addr, &named).await
+                    if let Some(rank) = self.own_or_named_coordinator_rank(addr, &named).await
                         && best.is_none_or(|(best_rank, _)| rank < best_rank)
                     {
                         best = Some((rank, addr));
@@ -5847,6 +5845,11 @@ impl P2pEndpoint {
                 }
                 config.coordinator = best.map(|(_, addr)| addr);
             }
+        }
+        // Introducer policy: this connect's hold on an introducer, if any
+        // ([`IntroducerGuard`]).
+        let mut introducer: Option<IntroducerGuard> = None;
+        if policy == CoordinatorPolicy::Introducer {
             // A live coordinator that is an introducer being hung up on is
             // not used: its connection is about to close.
             if config
@@ -11308,8 +11311,8 @@ impl P2pEndpoint {
         self.inner.reset_introducer_budget();
     }
 
-    /// Mark the embedder's own peers, replacing the previous list. Under
-    /// [`CoordinatorPolicy::Introducer`] a live peer may coordinate a dial
+    /// Mark the embedder's own peers, replacing the previous list. Under any
+    /// [`CoordinatorPolicy`] but `Any`, a live peer may coordinate a dial
     /// only when it is one of these or the target named it for itself. See
     /// [`NatTraversalEndpoint::set_own_peers`].
     pub fn set_own_peers(&self, peers: Vec<PeerId>) {
@@ -11377,11 +11380,15 @@ impl P2pEndpoint {
         self.inner.finish_introducer_close(addr);
     }
 
-    /// Under [`CoordinatorPolicy::Introducer`], whether the live peer at
-    /// `addr` may coordinate a dial whose target named `named` for itself:
+    /// Under any policy but [`CoordinatorPolicy::Any`], whether the live peer
+    /// at `addr` may coordinate a dial whose target named `named` for itself:
     /// `Some(0)` for a peer the embedder marked as its own, `Some(1)` for
     /// one the target named, `None` for any other.
-    async fn burst_coordinator_rank(&self, addr: SocketAddr, named: &[SocketAddr]) -> Option<u8> {
+    async fn own_or_named_coordinator_rank(
+        &self,
+        addr: SocketAddr,
+        named: &[SocketAddr],
+    ) -> Option<u8> {
         let addr = crate::shared::normalize_socket_addr(addr);
         let own = {
             let peers = self.connected_peers.read().await;
@@ -17027,6 +17034,38 @@ mod tests {
         client.shutdown().await;
         introducer.shutdown().await;
         introducer_task.abort();
+        contact_a.shutdown().await;
+        contact_a_task.abort();
+    }
+
+    /// Latched outside a burst (`ConnectedOnly`), a live contact `A` is never
+    /// asked to coordinate the dial to contact `B` either: with no own or
+    /// target-named live peer the dial ends after its direct stage. An own
+    /// peer still coordinates.
+    #[tokio::test]
+    async fn connected_only_never_asks_a_live_contact_to_coordinate_for_another() {
+        let (contact_a, contact_a_addr, contact_a_task, client) =
+            bursting_client_with_live_peer().await;
+        client.set_coordinator_policy(CoordinatorPolicy::ConnectedOnly);
+
+        let (silent, silent_addr) = silent_target();
+        connect_unreachable(&client, PeerId([0x6f; 32]), silent_addr).await;
+        assert_eq!(
+            client.inner.punch_starts_via_for_test(contact_a_addr),
+            0,
+            "contact A must never be asked to coordinate the dial to B"
+        );
+
+        client.set_own_peers(vec![contact_a.peer_id()]);
+        connect_unreachable(&client, PeerId([0x70; 32]), silent_addr).await;
+        assert!(
+            client.inner.punch_starts_via_for_test(contact_a_addr) >= 1,
+            "an own peer still coordinates"
+        );
+        assert_eq!(client.introducer_stats().dials, 0);
+
+        drop(silent);
+        client.shutdown().await;
         contact_a.shutdown().await;
         contact_a_task.abort();
     }

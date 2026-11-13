@@ -1616,8 +1616,10 @@ pub enum CoordinatorPolicy {
     /// peer to find one. The default.
     #[default]
     Any = 0,
-    /// Only a peer with a live connection; nothing is dialled to coordinate,
-    /// and a peer-id-only connect dials no known peer.
+    /// Only a peer with a live connection, and only one the embedder marked
+    /// as its own ([`NatTraversalEndpoint::set_own_peers`]) or the target
+    /// named for itself; nothing is dialled to coordinate, and a
+    /// peer-id-only connect dials no known peer.
     ConnectedOnly = 1,
     /// As [`Self::ConnectedOnly`], except that a connect to a target may
     /// dial one introducer: first one the target named for itself
@@ -1877,8 +1879,8 @@ pub struct NatTraversalEndpoint {
     /// [`NatTraversalEndpoint::reset_introducer_budget`].
     introducer_spent: ParkingMutex<HashSet<PeerId>>,
     /// The embedder's own peers ([`NatTraversalEndpoint::set_own_peers`]):
-    /// under [`CoordinatorPolicy::Introducer`] a live peer may coordinate
-    /// any dial only when it is one of these.
+    /// under any policy but `Any`, a live peer may coordinate any dial only
+    /// when it is one of these (or the target named it).
     own_peers: ParkingMutex<HashSet<PeerId>>,
     introducer_dials: AtomicU64,
     introducer_known_peer_dials: AtomicU64,
@@ -8234,8 +8236,8 @@ impl NatTraversalEndpoint {
     }
 
     /// Mark the peers that are the embedder's own (for example the other
-    /// devices of the same account), replacing the previous list. Under
-    /// [`CoordinatorPolicy::Introducer`] a live peer may coordinate a dial
+    /// devices of the same account), replacing the previous list. Under any
+    /// [`CoordinatorPolicy`] but `Any`, a live peer may coordinate a dial
     /// only when it is one of these, or when the target named it for itself
     /// ([`Self::set_peer_introducers`]); any other live peer is never told
     /// whom this endpoint is dialling. An empty list clears it.

@@ -73,6 +73,10 @@ pub struct EndpointConfig {
     pub(crate) pqc_config: Option<crate::crypto::pqc::PqcConfig>,
     /// Port configuration for endpoint binding
     pub(crate) port_config: EndpointPortConfig,
+    /// Whether connections of this endpoint act on a hole-punch request this
+    /// endpoint did not start (the target role). Shared with the embedder's
+    /// runtime switch (`set_inbound_punch_allowed`).
+    pub(crate) inbound_punch_allowed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EndpointConfig {
@@ -93,6 +97,7 @@ impl EndpointConfig {
             address_discovery_observe_all: false,
             pqc_config: Some(crate::crypto::pqc::PqcConfig::default()), // Enable PQC by default
             port_config: EndpointPortConfig::default(), // Use OS-assigned port by default
+            inbound_punch_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 

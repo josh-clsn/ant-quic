@@ -582,6 +582,17 @@ impl Node {
         self.inner.relay_service_allowed()
     }
 
+    /// Allow or refuse the target role of a hole punch at runtime. See
+    /// [`P2pEndpoint::set_inbound_punch_allowed`].
+    pub fn set_inbound_punch_allowed(&self, allowed: bool) {
+        self.inner.set_inbound_punch_allowed(allowed);
+    }
+
+    /// Whether the target role of a hole punch is allowed.
+    pub fn inbound_punch_allowed(&self) -> bool {
+        self.inner.inbound_punch_allowed()
+    }
+
     /// Set which coordinators hole punching may use. See
     /// [`crate::CoordinatorPolicy`].
     pub fn set_coordinator_policy(&self, policy: crate::CoordinatorPolicy) {

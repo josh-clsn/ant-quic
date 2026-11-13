@@ -1870,6 +1870,10 @@ pub struct NatTraversalEndpoint {
     /// Whether this endpoint serves others: MASQUE relay sessions and
     /// hole-punch coordination ([`NatTraversalEndpoint::set_relay_service_allowed`]).
     relay_service_allowed: AtomicBool,
+    /// Whether this endpoint acts on a hole punch it did not start (the
+    /// target role); shared with every connection through the endpoint
+    /// config ([`NatTraversalEndpoint::set_inbound_punch_allowed`]).
+    inbound_punch_allowed: Arc<AtomicBool>,
     /// Which coordinators hole punching may use ([`CoordinatorPolicy`]).
     coordinator_policy: std::sync::atomic::AtomicU8,
     /// Per target: the introducers it named for itself (its own hints),
@@ -3192,8 +3196,16 @@ impl NatTraversalEndpoint {
             .as_ref()
             .map(|arc| arc.as_ref())
             .unwrap_or(&empty_registry);
+        let inbound_punch_allowed = Arc::new(AtomicBool::new(true));
         let (inner_endpoint, event_tx, event_rx, local_addr, relay_server_config) =
-            Self::create_inner_endpoint(&config, token_store, registry_ref, None).await?;
+            Self::create_inner_endpoint(
+                &config,
+                token_store,
+                registry_ref,
+                None,
+                Arc::clone(&inbound_punch_allowed),
+            )
+            .await?;
 
         // Update discovery manager with the actual bound address and any additional addresses
         {
@@ -3317,6 +3329,7 @@ impl NatTraversalEndpoint {
             proactive_relay_pauses: AtomicU64::new(0),
             relay_fallback_allowed: AtomicBool::new(true),
             relay_service_allowed: AtomicBool::new(true),
+            inbound_punch_allowed,
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
             introducer_hints: ParkingMutex::new(IntroducerHintTable::new(
                 MAX_INTRODUCER_HINT_PEERS,
@@ -3740,12 +3753,14 @@ impl NatTraversalEndpoint {
             .as_ref()
             .map(|arc| arc.as_ref())
             .unwrap_or(&empty_registry);
+        let inbound_punch_allowed = Arc::new(AtomicBool::new(true));
         let (inner_endpoint, event_tx, event_rx, local_addr, relay_server_config) =
             if let Some(abs_socket) = abstract_socket {
                 let (ep, tx, rx, addr) = Self::create_inner_endpoint_with_abstract_socket(
                     &config,
                     token_store.clone(),
                     abs_socket,
+                    Arc::clone(&inbound_punch_allowed),
                 )
                 .await?;
                 (ep, tx, rx, addr, None)
@@ -3755,6 +3770,7 @@ impl NatTraversalEndpoint {
                     token_store.clone(),
                     registry_ref,
                     quinn_socket,
+                    Arc::clone(&inbound_punch_allowed),
                 )
                 .await?
             };
@@ -3881,6 +3897,7 @@ impl NatTraversalEndpoint {
             proactive_relay_pauses: AtomicU64::new(0),
             relay_fallback_allowed: AtomicBool::new(true),
             relay_service_allowed: AtomicBool::new(true),
+            inbound_punch_allowed,
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
             introducer_hints: ParkingMutex::new(IntroducerHintTable::new(
                 MAX_INTRODUCER_HINT_PEERS,
@@ -5496,6 +5513,18 @@ impl NatTraversalEndpoint {
                     return Ok(true);
                 }
 
+                if !self.inbound_punch_allowed() {
+                    // The target role is refused: no answer at all. Silence
+                    // rather than a rejection, because a stock coordinator
+                    // ignores a rejection from the target anyway, and silence
+                    // sends nothing from this endpoint.
+                    debug!(
+                        "coordinator control offer ignored (inbound punches refused) request_id={}",
+                        envelope.request_id
+                    );
+                    return Ok(true);
+                }
+
                 if *initiator == *target {
                     debug!(
                         "coordinator control offer ignored self_target request_id={} initiator={:?} target={:?}",
@@ -5862,6 +5891,13 @@ impl NatTraversalEndpoint {
                     );
                     return Ok(true);
                 } else if *target == self.local_peer_id() {
+                    if !self.inbound_punch_allowed() {
+                        debug!(
+                            "coordinator control accepted not dialled (inbound punches refused) request_id={}",
+                            envelope.request_id
+                        );
+                        return Ok(true);
+                    }
                     let mut normalized_initiator_addrs = initiator_addrs
                         .iter()
                         .copied()
@@ -6237,6 +6273,9 @@ impl NatTraversalEndpoint {
                 );
 
                 let connection = conn.clone();
+                // This endpoint asked this peer to coordinate: its PUNCH_ME_NOW
+                // for the request belongs to a punch of ours.
+                connection.expect_own_punch(expiry_duration);
                 let envelope = envelope.clone();
                 let traversal_event_notify = self.traversal_event_notify.clone();
                 tokio::spawn(async move {
@@ -6328,6 +6367,7 @@ impl NatTraversalEndpoint {
                                     };
                                 low_level_endpoint
                                     .register_connection_peer_id(coordinator, coordinator_peer_id);
+                                coordinator_connection.expect_own_punch(expiry_duration);
                                 remember_live_request(
                                     local_peer_id,
                                     peer_id,
@@ -6596,6 +6636,7 @@ impl NatTraversalEndpoint {
         token_store: Option<Arc<dyn crate::TokenStore>>,
         transport_registry: &crate::transport::TransportRegistry,
         quinn_socket: Option<std::net::UdpSocket>,
+        inbound_punch_allowed: Arc<AtomicBool>,
     ) -> Result<
         (
             InnerEndpoint,
@@ -6776,15 +6817,14 @@ impl NatTraversalEndpoint {
         // Clone server config for potential secondary endpoint (relay accept)
         let server_config_for_relay = server_config.clone();
 
-        let mut endpoint = InnerEndpoint::new(
-            EndpointConfig::default(),
-            server_config,
-            std_socket,
-            runtime,
-        )
-        .map_err(|e| {
-            NatTraversalError::ConfigError(format!("Failed to create QUIC endpoint: {e}"))
-        })?;
+        let endpoint_config = EndpointConfig {
+            inbound_punch_allowed,
+            ..EndpointConfig::default()
+        };
+        let mut endpoint = InnerEndpoint::new(endpoint_config, server_config, std_socket, runtime)
+            .map_err(|e| {
+                NatTraversalError::ConfigError(format!("Failed to create QUIC endpoint: {e}"))
+            })?;
 
         // Set default client config
         endpoint.set_default_client_config(client_config);
@@ -6816,6 +6856,7 @@ impl NatTraversalEndpoint {
         config: &NatTraversalConfig,
         token_store: Option<Arc<dyn crate::TokenStore>>,
         abstract_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket>,
+        inbound_punch_allowed: Arc<AtomicBool>,
     ) -> Result<
         (
             InnerEndpoint,
@@ -6899,8 +6940,12 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConfigError("No compatible async runtime found".to_string())
         })?;
 
+        let endpoint_config = EndpointConfig {
+            inbound_punch_allowed,
+            ..EndpointConfig::default()
+        };
         let mut endpoint = InnerEndpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
+            endpoint_config,
             server_config,
             abstract_socket,
             runtime,
@@ -7865,8 +7910,12 @@ impl NatTraversalEndpoint {
             NatTraversalError::ConfigError("No async runtime for relay endpoint".to_string())
         })?;
 
+        let relay_endpoint_config = crate::EndpointConfig {
+            inbound_punch_allowed: Arc::clone(&self.inbound_punch_allowed),
+            ..crate::EndpointConfig::default()
+        };
         let mut relay_endpoint = InnerEndpoint::new_with_abstract_socket(
-            crate::EndpointConfig::default(),
+            relay_endpoint_config,
             self.server_config.clone(),
             relay_socket,
             runtime,
@@ -8187,6 +8236,25 @@ impl NatTraversalEndpoint {
         if let Some(server) = self.relay_server.as_ref() {
             server.set_service_allowed(allowed);
         }
+    }
+
+    /// Whether this endpoint acts on hole punches it did not start (see
+    /// [`Self::set_inbound_punch_allowed`]).
+    pub fn inbound_punch_allowed(&self) -> bool {
+        self.inbound_punch_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Allow or refuse the target role of a hole punch. With `false`:
+    /// - a `CoordinationOffer` is not answered (no `CoordinationReady`, no
+    ///   punch toward the initiator's addresses);
+    /// - a `CoordinationAccepted` naming this endpoint as target is not
+    ///   dialled;
+    /// - a PUNCH_ME_NOW is ignored unless it belongs to a punch this endpoint
+    ///   started (it asked that peer to coordinate).
+    ///
+    /// A punch this endpoint initiates still works. Allowed by default.
+    pub fn set_inbound_punch_allowed(&self, allowed: bool) {
+        self.inbound_punch_allowed.store(allowed, Ordering::SeqCst);
     }
 
     /// Which coordinators hole punching may use.

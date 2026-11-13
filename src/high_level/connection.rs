@@ -856,6 +856,14 @@ impl Connection {
         conn.inner.send_nat_address_removal(sequence)
     }
 
+    /// Treat a PUNCH_ME_NOW from this peer within `within` as part of a punch
+    /// this endpoint started: it is acted on even while the endpoint refuses
+    /// inbound punches.
+    pub(crate) fn expect_own_punch(&self, within: std::time::Duration) {
+        let conn = &mut *self.0.state.lock("expect_own_punch");
+        conn.inner.expect_own_punch(Instant::now(), within);
+    }
+
     /// Queue a PUNCH_ME_NOW NAT traversal frame via the underlying connection
     pub fn send_nat_punch_coordination(
         &self,

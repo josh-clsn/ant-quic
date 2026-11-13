@@ -2620,6 +2620,20 @@ impl NatTraversalState {
         Ok(round)
     }
 
+    /// Whether a coordination round `round` that this endpoint itself
+    /// requested is in progress.
+    pub(super) fn has_own_coordination_round(&self, round: VarInt) -> bool {
+        self.coordination.as_ref().is_some_and(|coord| {
+            coord.round == round
+                && matches!(
+                    coord.state,
+                    CoordinationPhase::Requesting
+                        | CoordinationPhase::Coordinating
+                        | CoordinationPhase::Preparing
+                )
+        })
+    }
+
     pub(super) fn prime_passive_coordination_target(
         &mut self,
         incoming_round: VarInt,

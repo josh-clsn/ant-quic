@@ -285,6 +285,10 @@ pub struct Connection {
 
     /// NAT traversal state for establishing direct P2P connections
     nat_traversal: Option<NatTraversalState>,
+    /// Until when a PUNCH_ME_NOW on this connection belongs to a punch this
+    /// endpoint started (it asked this peer to coordinate), so it is acted
+    /// on even while the endpoint refuses the target role.
+    own_punch_until: Option<Instant>,
 
     /// NAT traversal frame format configuration
     nat_traversal_frame_config: frame::nat_traversal_unified::NatTraversalFrameConfig,
@@ -438,6 +442,7 @@ impl Connection {
             stats: ConnectionStats::default(),
             version,
             nat_traversal: None, // Will be initialized when NAT traversal is negotiated
+            own_punch_until: None,
             nat_traversal_frame_config:
                 frame::nat_traversal_unified::NatTraversalFrameConfig::default(),
             address_discovery_state: {
@@ -4940,6 +4945,12 @@ impl Connection {
         }
     }
 
+    /// Treat a PUNCH_ME_NOW from this peer within `within` as part of a
+    /// punch this endpoint started (it asked this peer to coordinate).
+    pub(crate) fn expect_own_punch(&mut self, now: Instant, within: Duration) {
+        self.own_punch_until = Some(now + within);
+    }
+
     /// Handle PunchMeNow frame from peer (via coordinator)
     ///
     /// v0.13.0: All nodes can coordinate - no role check needed.
@@ -4957,6 +4968,23 @@ impl Connection {
         let nat_state = self.nat_traversal.as_mut().ok_or_else(|| {
             TransportError::PROTOCOL_VIOLATION("PunchMeNow frame without NAT traversal negotiation")
         })?;
+
+        // The target role can be refused: then only a punch this endpoint
+        // started (it asked this peer to coordinate, or a coordination round
+        // of its own is in progress) is acted on.
+        let target_role_allowed = self
+            .endpoint_config
+            .inbound_punch_allowed
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let own_punch = self.own_punch_until.is_some_and(|until| now <= until)
+            || nat_state.has_own_coordination_round(punch_me_now.round);
+        if !target_role_allowed && !own_punch {
+            debug!(
+                "Ignoring PUNCH_ME_NOW for round {}: inbound punches are refused",
+                punch_me_now.round
+            );
+            return Ok(());
+        }
 
         // Create punch target based on the received information and prime
         // passive coordination directly from the incoming frame.

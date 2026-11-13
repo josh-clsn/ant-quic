@@ -11289,6 +11289,22 @@ impl P2pEndpoint {
         self.inner.relay_service_allowed()
     }
 
+    /// Allow or refuse the target role of a hole punch at runtime: with
+    /// `false` this endpoint answers no `CoordinationOffer`, dials no
+    /// initiator a coordinator names, and ignores a PUNCH_ME_NOW that does
+    /// not belong to a punch it started. Its own punches still work.
+    /// Allowed by default. See
+    /// [`NatTraversalEndpoint::set_inbound_punch_allowed`].
+    pub fn set_inbound_punch_allowed(&self, allowed: bool) {
+        self.inner.set_inbound_punch_allowed(allowed);
+    }
+
+    /// Whether the target role of a hole punch is allowed (see
+    /// [`Self::set_inbound_punch_allowed`]).
+    pub fn inbound_punch_allowed(&self) -> bool {
+        self.inner.inbound_punch_allowed()
+    }
+
     /// Set which coordinators hole punching may use; see
     /// [`CoordinatorPolicy`]. `Any` by default.
     pub fn set_coordinator_policy(&self, policy: CoordinatorPolicy) {
@@ -16288,6 +16304,206 @@ mod tests {
         target.shutdown().await;
         node.shutdown().await;
         node_task.abort();
+    }
+
+    // --- Inbound punch switch (`set_inbound_punch_allowed`) ---
+
+    /// A UDP socket nothing answers from, to see whether anything is sent
+    /// to it.
+    async fn watched_address() -> (tokio::net::UdpSocket, SocketAddr) {
+        let socket = tokio::net::UdpSocket::bind(loopback_ephemeral_addr())
+            .await
+            .expect("bind watched address");
+        let addr = socket.local_addr().expect("watched address");
+        (socket, addr)
+    }
+
+    async fn hears_anything(socket: &tokio::net::UdpSocket, within: Duration) -> bool {
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(within, socket.recv_from(&mut buf))
+            .await
+            .is_ok()
+    }
+
+    fn control_bytes(
+        message: crate::coordinator_control::CoordinatorControlMessage,
+    ) -> (u64, Vec<u8>) {
+        let request_id = crate::coordinator_control::next_request_id();
+        let (expires_at_unix_ms, _) =
+            crate::coordinator_control::wire_and_monotonic_expiry_after(Duration::from_secs(30));
+        let envelope = crate::coordinator_control::CoordinatorControlEnvelope {
+            request_id,
+            expires_at_unix_ms,
+            message,
+        };
+        (
+            request_id,
+            crate::coordinator_control::encode_coordinator_control(&envelope).expect("encode"),
+        )
+    }
+
+    /// With inbound punches refused, a node linked to a coordinator refuses
+    /// the target role: an offer gets no answer, an accepted coordination
+    /// naming it as target is not dialled, and a PUNCH_ME_NOW sends nothing
+    /// toward the address it names. A PUNCH_ME_NOW that belongs to a punch
+    /// the node asked this coordinator for is still acted on.
+    #[tokio::test]
+    async fn inbound_punch_off_refuses_the_target_role() {
+        use crate::coordinator_control::CoordinatorControlMessage;
+        let (coordinator, coordinator_addr, coordinator_accepts, coordinator_task) =
+            counting_endpoint().await;
+        let node = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), node.connect_addr(coordinator_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("the node reaches the coordinator");
+        wait_until("the coordinator accepted", || {
+            coordinator_accepts.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert!(node.inbound_punch_allowed(), "allowed by default");
+        node.set_inbound_punch_allowed(false);
+        let node_id = node.peer_id();
+        let coordinator_id = coordinator.peer_id();
+        let link = node
+            .inner
+            .get_connection(&coordinator_id)
+            .ok()
+            .flatten()
+            .expect("the node's link to the coordinator");
+        let mut back = None;
+        wait_until("the coordinator holds the node's link", || {
+            back = coordinator.inner.get_connection(&node_id).ok().flatten();
+            back.is_some()
+        })
+        .await;
+        let back = back.expect("the coordinator's link to the node");
+        let stranger = PeerId([0x51; 32]);
+
+        let (offer_watch, offer_addr) = watched_address().await;
+        let (request_id, bytes) = control_bytes(CoordinatorControlMessage::CoordinationOffer {
+            initiator: stranger,
+            target: node_id,
+            round: 1,
+            initiator_addrs: vec![offer_addr],
+        });
+        node.inner
+            .handle_coordinator_control_message(coordinator_id, link.clone(), &bytes)
+            .await
+            .expect("the offer is handled");
+        assert!(
+            crate::coordinator_control::inbound_offer(node_id, request_id).is_none(),
+            "the offer is not taken up"
+        );
+        assert!(!hears_anything(&offer_watch, Duration::from_millis(1500)).await);
+
+        let (accepted_watch, accepted_addr) = watched_address().await;
+        let (_, bytes) = control_bytes(CoordinatorControlMessage::CoordinationAccepted {
+            initiator: stranger,
+            target: node_id,
+            round: 1,
+            initiator_addrs: vec![accepted_addr],
+            target_addrs: Vec::new(),
+        });
+        node.inner
+            .handle_coordinator_control_message(coordinator_id, link.clone(), &bytes)
+            .await
+            .expect("the accepted coordination is handled");
+        assert!(
+            !hears_anything(&accepted_watch, Duration::from_millis(1500)).await,
+            "the node must not dial the initiator a coordinator names"
+        );
+
+        let (punch_watch, punch_addr) = watched_address().await;
+        let sequence = back
+            .send_nat_address_advertisement(punch_addr, 0)
+            .expect("advertise");
+        back.send_nat_punch_coordination(sequence, punch_addr, 1)
+            .expect("punch request");
+        assert!(
+            !hears_anything(&punch_watch, Duration::from_millis(2000)).await,
+            "the node must not punch toward an address a coordinator names"
+        );
+
+        // A punch the node started through this coordinator is acted on.
+        link.expect_own_punch(Duration::from_secs(30));
+        let (own_watch, own_addr) = watched_address().await;
+        let sequence = back
+            .send_nat_address_advertisement(own_addr, 0)
+            .expect("advertise");
+        back.send_nat_punch_coordination(sequence, own_addr, 2)
+            .expect("punch request");
+        assert!(
+            hears_anything(&own_watch, Duration::from_secs(5)).await,
+            "a punch of the node's own goes out"
+        );
+        assert!(!node.inbound_punch_allowed());
+
+        node.shutdown().await;
+        coordinator.shutdown().await;
+        coordinator_task.abort();
+    }
+
+    /// With inbound punches refused, a node's own coordinated punch still
+    /// connects end to end: an own peer coordinates the dial to a target
+    /// whose given address is dead, and the target is reached by the punch.
+    #[tokio::test]
+    async fn a_node_refusing_inbound_punches_still_punches_for_its_own_dial() {
+        let (coordinator, coordinator_addr, coordinator_accepts, coordinator_task) =
+            counting_endpoint().await;
+        let target = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let target_accept = tokio::spawn({
+            let target = target.clone();
+            async move { while target.accept().await.is_some() {} }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            target.connect_addr(coordinator_addr),
+        )
+        .await
+        .expect("connect does not time out")
+        .expect("the target reaches the coordinator");
+        let client = loopback_endpoint_with(|builder| builder).await;
+        let client_accept = tokio::spawn({
+            let client = client.clone();
+            async move { while client.accept().await.is_some() {} }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.connect_addr(coordinator_addr),
+        )
+        .await
+        .expect("connect does not time out")
+        .expect("the client reaches the coordinator");
+        wait_until("the coordinator holds both links", || {
+            coordinator_accepts.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::ConnectedOnly);
+        client.set_own_peers(vec![coordinator.peer_id()]);
+        client.set_inbound_punch_allowed(false);
+
+        let (silent, silent_addr) = silent_target();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            client.connect_with_fallback(Some(silent_addr), None, None, Some(target.peer_id())),
+        )
+        .await
+        .expect("the connect does not time out");
+        let (_, method) = result.expect("the own punch reaches the target");
+        assert!(
+            matches!(method, ConnectionMethod::HolePunched { .. }),
+            "{method:?}"
+        );
+
+        drop(silent);
+        client_accept.abort();
+        target_accept.abort();
+        client.shutdown().await;
+        target.shutdown().await;
+        coordinator.shutdown().await;
+        coordinator_task.abort();
     }
 
     /// A loopback endpoint that counts every inbound connection it accepts,

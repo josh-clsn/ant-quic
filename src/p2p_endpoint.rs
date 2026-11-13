@@ -5393,14 +5393,36 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        let coord_addr = if let Some(addr) = coordinator {
-            addr
+        let no_coordinator = || EndpointError::Config("No coordinator available".to_string());
+        let coord_addr = if self.inner.coordinator_policy() == CoordinatorPolicy::Any {
+            match coordinator {
+                Some(addr) => addr,
+                None => self
+                    .coordinator_candidates()
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(no_coordinator)?,
+            }
         } else {
-            self.coordinator_candidates()
-                .await
-                .into_iter()
-                .next()
-                .ok_or_else(|| EndpointError::Config("No coordinator available".to_string()))?
+            // As in `connect_with_fallback`: only a live peer that is the
+            // embedder's own or one the target named may coordinate, the
+            // caller's own pick included.
+            let named = self.inner.introducer_hints_for(&peer_id);
+            let candidates = match coordinator {
+                Some(addr) if self.live_peer_addrs().await.contains(&addr) => vec![addr],
+                Some(_) => Vec::new(),
+                None => self.coordinator_candidates().await,
+            };
+            let mut best: Option<(u8, SocketAddr)> = None;
+            for addr in candidates {
+                if let Some(rank) = self.own_or_named_coordinator_rank(addr, &named).await
+                    && best.is_none_or(|(best_rank, _)| rank < best_rank)
+                {
+                    best = Some((rank, addr));
+                }
+            }
+            best.map(|(_, addr)| addr).ok_or_else(no_coordinator)?
         };
 
         info!(
@@ -17301,6 +17323,37 @@ mod tests {
         assert_eq!(client.introducer_stats().dials, 0);
 
         drop(silent);
+        client.shutdown().await;
+        contact_a.shutdown().await;
+        contact_a_task.abort();
+    }
+
+    /// The deprecated `connect_to_peer` follows the own-or-named rule too:
+    /// under `ConnectedOnly` with only a live contact `A`, a peer-id connect
+    /// to another contact gets no coordinator (A is never asked), and an
+    /// explicit coordinator that is neither own nor named is refused.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn connect_to_peer_never_asks_a_live_contact_to_coordinate() {
+        let (contact_a, contact_a_addr, contact_a_task, client) =
+            bursting_client_with_live_peer().await;
+        client.set_coordinator_policy(CoordinatorPolicy::ConnectedOnly);
+        let target = PeerId([0x74; 32]);
+
+        for coordinator in [None, Some(contact_a_addr)] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.connect_to_peer(target, coordinator),
+            )
+            .await
+            .expect("refused at once, not after a traversal attempt");
+            assert!(
+                matches!(&result, Err(EndpointError::Config(reason)) if reason.contains("No coordinator")),
+                "{coordinator:?}: {:?}",
+                result.map(|_| ())
+            );
+        }
+
         client.shutdown().await;
         contact_a.shutdown().await;
         contact_a_task.abort();

@@ -8283,6 +8283,12 @@ impl NatTraversalEndpoint {
         self.introducer_hints.lock().get(peer)
     }
 
+    /// The introducers recorded for `peer` ([`Self::set_peer_introducers`]),
+    /// normalized; empty when none are.
+    pub fn peer_introducers(&self, peer: &PeerId) -> Vec<SocketAddr> {
+        self.introducer_hints_for(peer)
+    }
+
     /// Let every target use one introducer again (a new burst).
     pub fn reset_introducer_budget(&self) {
         self.introducer_spent.lock().clear();

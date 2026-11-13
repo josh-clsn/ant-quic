@@ -610,6 +610,11 @@ impl Node {
         self.inner.set_peer_introducers(peer, introducers);
     }
 
+    /// The introducers recorded for `peer`.
+    pub fn peer_introducers(&self, peer: &PeerId) -> Vec<SocketAddr> {
+        self.inner.peer_introducers(peer)
+    }
+
     /// Let every target use one introducer again (a new burst).
     pub fn reset_introducer_budget(&self) {
         self.inner.reset_introducer_budget();

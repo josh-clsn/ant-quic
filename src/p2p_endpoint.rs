@@ -11322,6 +11322,11 @@ impl P2pEndpoint {
         self.inner.set_peer_introducers(peer, introducers);
     }
 
+    /// The introducers recorded for `peer` (see [`Self::set_peer_introducers`]).
+    pub fn peer_introducers(&self, peer: &PeerId) -> Vec<SocketAddr> {
+        self.inner.peer_introducers(peer)
+    }
+
     /// Let every target use one introducer again (a new burst).
     pub fn reset_introducer_budget(&self) {
         self.inner.reset_introducer_budget();
@@ -17195,6 +17200,21 @@ mod tests {
         client.shutdown().await;
         seed.shutdown().await;
         seed_task.abort();
+    }
+
+    /// `peer_introducers` reads back what `set_peer_introducers` recorded,
+    /// and an empty list forgets it.
+    #[tokio::test]
+    async fn peer_introducers_reads_back_and_forgets() {
+        let client = loopback_endpoint_with(|builder| builder).await;
+        let target = PeerId([0x73; 32]);
+        let hint: SocketAddr = "127.0.0.1:9100".parse().expect("addr");
+        assert!(client.peer_introducers(&target).is_empty());
+        client.set_peer_introducers(target, vec![hint]);
+        assert_eq!(client.peer_introducers(&target), vec![hint]);
+        client.set_peer_introducers(target, Vec::new());
+        assert!(client.peer_introducers(&target).is_empty());
+        client.shutdown().await;
     }
 
     /// A client in a burst (`Introducer`, relay fallback off) with a live

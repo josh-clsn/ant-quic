@@ -1561,6 +1561,51 @@ const MAX_INTRODUCERS_PER_PEER: usize = 8;
 /// How many own peers [`NatTraversalEndpoint::set_own_peers`] keeps.
 const MAX_OWN_PEERS: usize = 256;
 
+/// Per target, the introducers it named for itself, bounded at `capacity`
+/// targets. Kept in the order they were recorded, so a full table evicts
+/// the target recorded longest ago.
+#[derive(Debug)]
+struct IntroducerHintTable {
+    capacity: usize,
+    hints: indexmap::IndexMap<PeerId, Vec<SocketAddr>>,
+}
+
+impl IntroducerHintTable {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            hints: indexmap::IndexMap::new(),
+        }
+    }
+
+    /// Record `peer`'s introducers, as the newest entry; an empty list
+    /// forgets them.
+    fn set(&mut self, peer: PeerId, introducers: Vec<SocketAddr>) {
+        self.hints.shift_remove(&peer);
+        if introducers.is_empty() {
+            return;
+        }
+        if self.hints.len() >= self.capacity {
+            self.hints.shift_remove_index(0);
+        }
+        let introducers = introducers
+            .into_iter()
+            .map(normalize_socket_addr)
+            .take(MAX_INTRODUCERS_PER_PEER)
+            .collect();
+        self.hints.insert(peer, introducers);
+    }
+
+    fn get(&self, peer: &PeerId) -> Vec<SocketAddr> {
+        self.hints.get(peer).cloned().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.hints.len()
+    }
+}
+
 /// Which coordinators hole punching may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -1827,7 +1872,7 @@ pub struct NatTraversalEndpoint {
     coordinator_policy: std::sync::atomic::AtomicU8,
     /// Per target: the introducers it named for itself (its own hints),
     /// tried first under [`CoordinatorPolicy::Introducer`].
-    introducer_hints: ParkingMutex<HashMap<PeerId, Vec<SocketAddr>>>,
+    introducer_hints: ParkingMutex<IntroducerHintTable>,
     /// Targets that used their one introducer since the last
     /// [`NatTraversalEndpoint::reset_introducer_budget`].
     introducer_spent: ParkingMutex<HashSet<PeerId>>,
@@ -3271,7 +3316,9 @@ impl NatTraversalEndpoint {
             relay_fallback_allowed: AtomicBool::new(true),
             relay_service_allowed: AtomicBool::new(true),
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
-            introducer_hints: ParkingMutex::new(HashMap::new()),
+            introducer_hints: ParkingMutex::new(IntroducerHintTable::new(
+                MAX_INTRODUCER_HINT_PEERS,
+            )),
             introducer_spent: ParkingMutex::new(HashSet::new()),
             own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
@@ -3833,7 +3880,9 @@ impl NatTraversalEndpoint {
             relay_fallback_allowed: AtomicBool::new(true),
             relay_service_allowed: AtomicBool::new(true),
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
-            introducer_hints: ParkingMutex::new(HashMap::new()),
+            introducer_hints: ParkingMutex::new(IntroducerHintTable::new(
+                MAX_INTRODUCER_HINT_PEERS,
+            )),
             introducer_spent: ParkingMutex::new(HashSet::new()),
             own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
@@ -8157,28 +8206,11 @@ impl NatTraversalEndpoint {
     /// [`CoordinatorPolicy::Introducer`] they are tried before known peers.
     /// An empty list forgets them.
     pub fn set_peer_introducers(&self, peer: PeerId, introducers: Vec<SocketAddr>) {
-        let mut hints = self.introducer_hints.lock();
-        if introducers.is_empty() {
-            hints.remove(&peer);
-            return;
-        }
-        if hints.len() >= MAX_INTRODUCER_HINT_PEERS && !hints.contains_key(&peer) {
-            hints.clear();
-        }
-        let introducers = introducers
-            .into_iter()
-            .map(normalize_socket_addr)
-            .take(MAX_INTRODUCERS_PER_PEER)
-            .collect();
-        hints.insert(peer, introducers);
+        self.introducer_hints.lock().set(peer, introducers);
     }
 
     pub(crate) fn introducer_hints_for(&self, peer: &PeerId) -> Vec<SocketAddr> {
-        self.introducer_hints
-            .lock()
-            .get(peer)
-            .cloned()
-            .unwrap_or_default()
+        self.introducer_hints.lock().get(peer)
     }
 
     /// Let every target use one introducer again (a new burst).
@@ -14991,6 +15023,34 @@ impl crate::TokenStore for DefaultTokenStore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A full introducer hint table makes room for a new target by evicting
+    /// the target recorded longest ago, not by forgetting every target.
+    #[test]
+    fn a_full_introducer_hint_table_evicts_the_oldest_target() {
+        let addr = |port: u16| -> SocketAddr { SocketAddr::from(([127, 0, 0, 1], port)) };
+        let peer = |byte: u8| PeerId([byte; 32]);
+        let mut table = IntroducerHintTable::new(3);
+        table.set(peer(1), vec![addr(1)]);
+        table.set(peer(2), vec![addr(2)]);
+        table.set(peer(3), vec![addr(3)]);
+        // Recording peer 1 again makes it the newest.
+        table.set(peer(1), vec![addr(11)]);
+
+        table.set(peer(4), vec![addr(4)]);
+        assert_eq!(table.len(), 3, "one target evicted, not all");
+        assert!(table.get(&peer(2)).is_empty(), "the oldest went");
+        assert_eq!(table.get(&peer(1)), vec![addr(11)]);
+        assert_eq!(table.get(&peer(3)), vec![addr(3)]);
+        assert_eq!(table.get(&peer(4)), vec![addr(4)]);
+
+        // Forgetting one frees its slot without evicting another.
+        table.set(peer(3), Vec::new());
+        table.set(peer(5), vec![addr(5)]);
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(&peer(1)), vec![addr(11)]);
+        assert_eq!(table.get(&peer(4)), vec![addr(4)]);
+    }
 
     #[cfg(feature = "network-discovery")]
     #[test]

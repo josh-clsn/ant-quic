@@ -614,6 +614,18 @@ impl Node {
         self.inner.own_peers()
     }
 
+    /// Allow or refuse known peers (the bootstrap seeds) as introducers
+    /// under [`crate::CoordinatorPolicy::Introducer`]. See
+    /// [`P2pEndpoint::set_known_peer_introducers_allowed`].
+    pub fn set_known_peer_introducers_allowed(&self, allowed: bool) {
+        self.inner.set_known_peer_introducers_allowed(allowed);
+    }
+
+    /// Whether known peers may be introducers.
+    pub fn known_peer_introducers_allowed(&self) -> bool {
+        self.inner.known_peer_introducers_allowed()
+    }
+
     /// Introducer dials and the bytes they carried.
     pub fn introducer_stats(&self) -> crate::IntroducerStats {
         self.inner.introducer_stats()

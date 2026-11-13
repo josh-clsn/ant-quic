@@ -1614,6 +1614,9 @@ struct IntroducerEntry {
 pub struct IntroducerStats {
     /// Introducer connections dialled.
     pub dials: u64,
+    /// Of those, dials to an introducer the target did not name for itself:
+    /// a known peer (bootstrap seed) taken as the fallback.
+    pub known_peer_dials: u64,
     /// UDP bytes sent on them, counted when each was closed.
     pub bytes_sent: u64,
     /// UDP bytes received on them, counted when each was closed.
@@ -1833,6 +1836,10 @@ pub struct NatTraversalEndpoint {
     /// any dial only when it is one of these.
     own_peers: ParkingMutex<HashSet<PeerId>>,
     introducer_dials: AtomicU64,
+    introducer_known_peer_dials: AtomicU64,
+    /// Whether a target with no introducer of its own may use a known peer
+    /// (bootstrap seed) as its introducer.
+    known_peer_introducers_allowed: AtomicBool,
     /// Open introducers by address ([`IntroducerEntry`]).
     introducer_refs: ParkingMutex<HashMap<SocketAddr, IntroducerEntry>>,
     #[cfg(test)]
@@ -3268,6 +3275,8 @@ impl NatTraversalEndpoint {
             introducer_spent: ParkingMutex::new(HashSet::new()),
             own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
+            introducer_known_peer_dials: AtomicU64::new(0),
+            known_peer_introducers_allowed: AtomicBool::new(true),
             introducer_refs: ParkingMutex::new(HashMap::new()),
             #[cfg(test)]
             introducer_pick_gate: ParkingMutex::new(None),
@@ -3828,6 +3837,8 @@ impl NatTraversalEndpoint {
             introducer_spent: ParkingMutex::new(HashSet::new()),
             own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
+            introducer_known_peer_dials: AtomicU64::new(0),
+            known_peer_introducers_allowed: AtomicBool::new(true),
             introducer_refs: ParkingMutex::new(HashMap::new()),
             #[cfg(test)]
             introducer_pick_gate: ParkingMutex::new(None),
@@ -8175,6 +8186,21 @@ impl NatTraversalEndpoint {
         self.introducer_spent.lock().clear();
     }
 
+    /// Whether a target with no introducer of its own may use a known peer
+    /// as its introducer (see [`Self::set_known_peer_introducers_allowed`]).
+    pub fn known_peer_introducers_allowed(&self) -> bool {
+        self.known_peer_introducers_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Allow or refuse known peers (the bootstrap seeds) as introducers under
+    /// [`CoordinatorPolicy::Introducer`]. With `false`, a target's own
+    /// introducers ([`Self::set_peer_introducers`]) are the only ones, and a
+    /// target that named none gets no hole punch. Allowed by default.
+    pub fn set_known_peer_introducers_allowed(&self, allowed: bool) {
+        self.known_peer_introducers_allowed
+            .store(allowed, Ordering::SeqCst);
+    }
+
     /// Mark the peers that are the embedder's own (for example the other
     /// devices of the same account), replacing the previous list. Under
     /// [`CoordinatorPolicy::Introducer`] a live peer may coordinate a dial
@@ -8429,8 +8455,12 @@ impl NatTraversalEndpoint {
             .unwrap_or(0)
     }
 
-    pub(crate) fn record_introducer_dial(&self) {
+    pub(crate) fn record_introducer_dial(&self, known_peer: bool) {
         self.introducer_dials.fetch_add(1, Ordering::Relaxed);
+        if known_peer {
+            self.introducer_known_peer_dials
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn record_introducer_bytes(&self, sent: u64, received: u64) {
@@ -8445,6 +8475,7 @@ impl NatTraversalEndpoint {
     pub fn introducer_stats(&self) -> IntroducerStats {
         IntroducerStats {
             dials: self.introducer_dials.load(Ordering::Relaxed),
+            known_peer_dials: self.introducer_known_peer_dials.load(Ordering::Relaxed),
             bytes_sent: self.introducer_bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.introducer_bytes_received.load(Ordering::Relaxed),
         }

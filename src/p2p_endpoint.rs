@@ -5866,9 +5866,11 @@ impl P2pEndpoint {
                 // is skipped.
                 let targets = [target_ipv4, target_ipv6];
                 let mut candidates = self.inner.introducer_hints_for(&target_peer);
-                for addr in self.runtime_known_peer_udp_addrs() {
-                    if !candidates.contains(&addr) {
-                        candidates.push(addr);
+                if self.inner.known_peer_introducers_allowed() {
+                    for addr in self.runtime_known_peer_udp_addrs() {
+                        if !candidates.contains(&addr) {
+                            candidates.push(addr);
+                        }
                     }
                 }
                 candidates.retain(|addr| {
@@ -6311,7 +6313,13 @@ impl P2pEndpoint {
                         .start_hole_punch_session(coordinator, target_peer_id, may_dial_coordinator)
                         .await;
                     if dialling_introducer {
-                        self.inner.record_introducer_dial();
+                        // A dial to an introducer the target did not name is
+                        // the known-peer (seed) fallback.
+                        let named = self
+                            .inner
+                            .introducer_hints_for(&target_peer_id)
+                            .contains(&crate::shared::normalize_socket_addr(coordinator));
+                        self.inner.record_introducer_dial(!named);
                         if !self.is_connected_to_addr(coordinator).await {
                             self.inner.mark_introducer_dial_failed(coordinator);
                         }
@@ -11311,6 +11319,18 @@ impl P2pEndpoint {
     /// The peers marked as the embedder's own.
     pub fn own_peers(&self) -> Vec<PeerId> {
         self.inner.own_peers()
+    }
+
+    /// Allow or refuse known peers (the bootstrap seeds) as introducers
+    /// under [`crate::CoordinatorPolicy::Introducer`]. See
+    /// [`NatTraversalEndpoint::set_known_peer_introducers_allowed`].
+    pub fn set_known_peer_introducers_allowed(&self, allowed: bool) {
+        self.inner.set_known_peer_introducers_allowed(allowed);
+    }
+
+    /// Whether known peers may be introducers.
+    pub fn known_peer_introducers_allowed(&self) -> bool {
+        self.inner.known_peer_introducers_allowed()
     }
 
     /// Introducer dials and the bytes they carried.
@@ -16385,6 +16405,7 @@ mod tests {
         );
         let stats = client.introducer_stats();
         assert_eq!(stats.dials, 1);
+        assert_eq!(stats.known_peer_dials, 0, "the target named it");
         assert!(
             stats.bytes_sent > 0 && stats.bytes_received > 0,
             "{stats:?}"
@@ -16915,6 +16936,42 @@ mod tests {
         client.shutdown().await;
         coordinator.shutdown().await;
         coordinator_task.abort();
+    }
+
+    /// A target that named no introducer falls back to a known peer (the
+    /// seed), and that dial is counted as a known-peer dial. With known-peer
+    /// introducers off, the seed is never dialled.
+    #[tokio::test]
+    async fn the_seed_fallback_is_counted_and_can_be_turned_off() {
+        let (seed, seed_addr, seed_accepts, seed_task) = counting_endpoint().await;
+        let client = loopback_endpoint_with(|builder| builder.known_peer(seed_addr)).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        assert!(
+            client.known_peer_introducers_allowed(),
+            "allowed by default"
+        );
+        let (silent, silent_addr) = silent_target();
+
+        client.set_known_peer_introducers_allowed(false);
+        connect_unreachable(&client, PeerId([0x6d; 32]), silent_addr).await;
+        assert_eq!(
+            seed_accepts.load(Ordering::SeqCst),
+            0,
+            "with the fallback off the seed is never dialled"
+        );
+        assert_eq!(client.introducer_stats().dials, 0);
+
+        client.set_known_peer_introducers_allowed(true);
+        connect_unreachable(&client, PeerId([0x6e; 32]), silent_addr).await;
+        assert_eq!(seed_accepts.load(Ordering::SeqCst), 1, "the seed fallback");
+        let stats = client.introducer_stats();
+        assert_eq!((stats.dials, stats.known_peer_dials), (1, 1), "{stats:?}");
+
+        drop(silent);
+        client.shutdown().await;
+        seed.shutdown().await;
+        seed_task.abort();
     }
 
     /// A client in a burst (`Introducer`, relay fallback off) with a live

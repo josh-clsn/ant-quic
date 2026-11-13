@@ -202,6 +202,9 @@ pub struct MasqueRelayServer {
     started_at: Instant,
     /// Bridged connection count (IPv4↔IPv6)
     bridged_connections: AtomicU64,
+    /// Whether the server serves at all ([`Self::set_service_allowed`]).
+    /// Forwarding loops watch it and end when it turns off.
+    service_allowed: tokio::sync::watch::Sender<bool>,
 }
 
 impl MasqueRelayServer {
@@ -219,6 +222,7 @@ impl MasqueRelayServer {
             stats: Arc::new(MasqueRelayStats::new()),
             started_at: Instant::now(),
             bridged_connections: AtomicU64::new(0),
+            service_allowed: tokio::sync::watch::Sender::new(true),
         }
     }
 
@@ -267,7 +271,26 @@ impl MasqueRelayServer {
             stats: Arc::new(MasqueRelayStats::new()),
             started_at: Instant::now(),
             bridged_connections: AtomicU64::new(0),
+            service_allowed: tokio::sync::watch::Sender::new(true),
         }
+    }
+
+    /// Allow or refuse relay service. With `false`, every CONNECT-UDP
+    /// request is refused (403) and every forwarding loop ends, closing its
+    /// session. Allowed by default.
+    pub fn set_service_allowed(&self, allowed: bool) {
+        self.service_allowed.send_replace(allowed);
+    }
+
+    /// Whether relay service is allowed (see [`Self::set_service_allowed`]).
+    pub fn service_allowed(&self) -> bool {
+        *self.service_allowed.borrow()
+    }
+
+    /// Resolves once relay service is turned off (at once if it is off).
+    async fn service_turned_off(&self) {
+        let mut allowed = self.service_allowed.subscribe();
+        let _ = allowed.wait_for(|allowed| !*allowed).await;
     }
 
     /// Check if this server supports dual-stack (IPv4 and IPv6)
@@ -458,6 +481,10 @@ impl MasqueRelayServer {
         request: &ConnectUdpRequest,
         client_addr: SocketAddr,
     ) -> RelayResult<ConnectUdpResponse> {
+        if !self.service_allowed() {
+            return Ok(ConnectUdpResponse::forbidden("Relay service disabled"));
+        }
+
         // Check session limit
         let current_sessions = self.stats.current_active_sessions();
         if current_sessions >= self.config.max_sessions as u64 {
@@ -918,6 +945,10 @@ impl MasqueRelayServer {
                 }
             } => {},
 
+            () = self.service_turned_off() => {
+                tracing::info!(session_id, "Relay service turned off, ending forwarding");
+            },
+
             // Periodic relay-traffic heartbeat. Emits one warn-level line per
             // tick with the cumulative bytes forwarded by THIS server (not just
             // this session — stats are server-wide). The cross-env test harness
@@ -1125,6 +1156,14 @@ impl MasqueRelayServer {
                 // must reset so the client's length-prefixed reader sees a
                 // stream error instead of misparsing a truncated frame.
                 read_clean && !mid_frame.load(Ordering::Relaxed)
+            },
+
+            // Relay service turned off: the session ends. Dropping the send
+            // stream unfinished resets it, so the client sees the session
+            // fail rather than end cleanly.
+            () = self.service_turned_off() => {
+                tracing::info!(session_id, "Relay service turned off, ending stream forwarding");
+                false
             },
         };
 

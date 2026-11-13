@@ -570,6 +570,18 @@ impl Node {
         self.inner.relay_fallback_allowed()
     }
 
+    /// Allow or refuse serving others as a relay and a hole-punch
+    /// coordinator at runtime. See
+    /// [`P2pEndpoint::set_relay_service_allowed`].
+    pub fn set_relay_service_allowed(&self, allowed: bool) {
+        self.inner.set_relay_service_allowed(allowed);
+    }
+
+    /// Whether relay and coordinator service are allowed.
+    pub fn relay_service_allowed(&self) -> bool {
+        self.inner.relay_service_allowed()
+    }
+
     /// Set which coordinators hole punching may use. See
     /// [`crate::CoordinatorPolicy`].
     pub fn set_coordinator_policy(&self, policy: crate::CoordinatorPolicy) {

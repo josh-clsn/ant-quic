@@ -1815,6 +1815,9 @@ pub struct NatTraversalEndpoint {
     proactive_relay_pauses: AtomicU64,
     /// Whether a connect may fall back to a MASQUE relay.
     relay_fallback_allowed: AtomicBool,
+    /// Whether this endpoint serves others: MASQUE relay sessions and
+    /// hole-punch coordination ([`NatTraversalEndpoint::set_relay_service_allowed`]).
+    relay_service_allowed: AtomicBool,
     /// Which coordinators hole punching may use ([`CoordinatorPolicy`]).
     coordinator_policy: std::sync::atomic::AtomicU8,
     /// Per target: the introducers it named for itself (its own hints),
@@ -3253,6 +3256,7 @@ impl NatTraversalEndpoint {
             relay_client_bytes: Arc::new(crate::masque::RelaySocketCounters::default()),
             proactive_relay_pauses: AtomicU64::new(0),
             relay_fallback_allowed: AtomicBool::new(true),
+            relay_service_allowed: AtomicBool::new(true),
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
             introducer_hints: ParkingMutex::new(HashMap::new()),
             introducer_spent: ParkingMutex::new(HashSet::new()),
@@ -3811,6 +3815,7 @@ impl NatTraversalEndpoint {
             relay_client_bytes: Arc::new(crate::masque::RelaySocketCounters::default()),
             proactive_relay_pauses: AtomicU64::new(0),
             relay_fallback_allowed: AtomicBool::new(true),
+            relay_service_allowed: AtomicBool::new(true),
             coordinator_policy: std::sync::atomic::AtomicU8::new(CoordinatorPolicy::Any as u8),
             introducer_hints: ParkingMutex::new(HashMap::new()),
             introducer_spent: ParkingMutex::new(HashSet::new()),
@@ -5237,6 +5242,23 @@ impl NatTraversalEndpoint {
                     },
                 };
 
+                if !self.relay_service_allowed() {
+                    // Coordinator service is off. `UnknownTarget` ("no route
+                    // to the target through me") is a reason every peer can
+                    // parse, so it moves on at once.
+                    debug!(
+                        "coordinator control request refused (service off) request_id={} from_peer={:?}",
+                        envelope.request_id, from_peer_id
+                    );
+                    let _ = self
+                        .send_coordinator_control_on_connection(
+                            _connection.clone(),
+                            reject(RejectionReason::UnknownTarget),
+                        )
+                        .await;
+                    return Ok(true);
+                }
+
                 if *initiator == *target {
                     let _ = self
                         .send_coordinator_control_on_connection(
@@ -5509,6 +5531,13 @@ impl NatTraversalEndpoint {
                     "coordinator control ready request_id={} from_peer={:?} initiator={:?} target={:?} round={}",
                     envelope.request_id, from_peer_id, initiator, target, round
                 );
+
+                if !self.relay_service_allowed() {
+                    // Coordinator service turned off after the request came
+                    // in: the coordination is not completed.
+                    let _ = remove_pending_request(envelope.request_id);
+                    return Ok(true);
+                }
 
                 let pending = match get_pending_request(envelope.request_id) {
                     Some(p) => p,
@@ -8065,6 +8094,29 @@ impl NatTraversalEndpoint {
     /// [`Self::set_proactive_relay_allowed`]. Allowed by default.
     pub fn set_relay_fallback_allowed(&self, allowed: bool) {
         self.relay_fallback_allowed.store(allowed, Ordering::SeqCst);
+    }
+
+    /// Whether this endpoint serves others as a relay and a hole-punch
+    /// coordinator (see [`Self::set_relay_service_allowed`]).
+    pub fn relay_service_allowed(&self) -> bool {
+        self.relay_service_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Allow or refuse serving others. With `false`:
+    /// - a CONNECT-UDP request on any connection is refused (403), so no
+    ///   relay session is created for anyone;
+    /// - every relay session this endpoint serves ends: its forwarding loop
+    ///   stops and the session closes;
+    /// - a hole-punch coordination request is refused, and a coordination
+    ///   this endpoint was relaying is not completed.
+    ///
+    /// The endpoint's own use of relays and coordinators is untouched; those
+    /// have their own switches. Allowed by default.
+    pub fn set_relay_service_allowed(&self, allowed: bool) {
+        self.relay_service_allowed.store(allowed, Ordering::SeqCst);
+        if let Some(server) = self.relay_server.as_ref() {
+            server.set_service_allowed(allowed);
+        }
     }
 
     /// Which coordinators hole punching may use.
@@ -14318,6 +14370,12 @@ impl NatTraversalEndpoint {
                 Ok(())
             }
 
+            crate::shared::EndpointEventInner::RelayPunchMeNow(_, _)
+                if !self.relay_service_allowed() =>
+            {
+                debug!("Not relaying PUNCH_ME_NOW: coordinator service is off");
+                Ok(())
+            }
             crate::shared::EndpointEventInner::RelayPunchMeNow(target_peer_id, punch_frame) => {
                 // RFC-compliant address-based relay: find peer by address, not synthetic peer ID
                 let target_address = punch_frame.address;

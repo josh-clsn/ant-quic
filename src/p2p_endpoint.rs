@@ -4296,17 +4296,19 @@ impl P2pEndpoint {
     /// Returns whether this endpoint is willing to provide relay service for peers.
     ///
     /// ant-quic uses an always-on symmetric assist plane, so this reports the
-    /// effective runtime behaviour rather than any legacy config flag.
+    /// effective runtime behaviour rather than any legacy config flag: true
+    /// unless [`Self::set_relay_service_allowed`] turned it off.
     pub fn relay_service_enabled(&self) -> bool {
-        true
+        self.inner.relay_service_allowed()
     }
 
     /// Returns whether this endpoint advertises coordinator capability.
     ///
     /// ant-quic uses a symmetric model where every node can participate in
     /// coordination decisions; remote peers still decide whether to use it.
-    pub const fn coordinator_service_enabled(&self) -> bool {
-        true
+    /// False while [`Self::set_relay_service_allowed`] has it off.
+    pub fn coordinator_service_enabled(&self) -> bool {
+        self.inner.relay_service_allowed()
     }
 
     /// Returns whether this endpoint advertises bootstrap/known-peer assist capability.
@@ -11234,6 +11236,21 @@ impl P2pEndpoint {
         self.inner.relay_fallback_allowed()
     }
 
+    /// Allow or refuse serving others as a MASQUE relay and a hole-punch
+    /// coordinator at runtime. With `false`, a CONNECT-UDP request on any
+    /// connection is refused, the relay sessions this endpoint serves end,
+    /// and coordination requests are refused. Allowed by default. See
+    /// [`NatTraversalEndpoint::set_relay_service_allowed`].
+    pub fn set_relay_service_allowed(&self, allowed: bool) {
+        self.inner.set_relay_service_allowed(allowed);
+    }
+
+    /// Whether relay and coordinator service are allowed (see
+    /// [`Self::set_relay_service_allowed`]).
+    pub fn relay_service_allowed(&self) -> bool {
+        self.inner.relay_service_allowed()
+    }
+
     /// Set which coordinators hole punching may use; see
     /// [`CoordinatorPolicy`]. `Any` by default.
     pub fn set_coordinator_policy(&self, policy: CoordinatorPolicy) {
@@ -15994,6 +16011,188 @@ mod tests {
         client.shutdown().await;
         relay.shutdown().await;
         relay_accept.abort();
+    }
+
+    // --- Relay service switch (`set_relay_service_allowed`) ---
+
+    /// A node (a latched phone) that dialled one peer, its only link.
+    async fn node_and_dialled_peer() -> (
+        P2pEndpoint,
+        SocketAddr,
+        P2pEndpoint,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let peer = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let peer_addr = localhost_addr(peer.local_addr().expect("peer addr"));
+        let peer_accept = tokio::spawn({
+            let peer = peer.clone();
+            async move { while peer.accept().await.is_some() {} }
+        });
+        let node = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        tokio::time::timeout(Duration::from_secs(10), node.connect_addr(peer_addr))
+            .await
+            .expect("dial does not time out")
+            .expect("the node dials the peer");
+        // The node's address as the peer sees it on that link, so a relay
+        // request from the peer goes over the link the node dialled.
+        let node_id = node.peer_id();
+        let mut node_addr = None;
+        wait_until("the peer holds the node's link", || {
+            node_addr = peer
+                .inner
+                .get_connection(&node_id)
+                .ok()
+                .flatten()
+                .map(|link| link.remote_address());
+            node_addr.is_some()
+        })
+        .await;
+        let node_addr = node_addr.expect("the peer sees the node");
+        (node, node_addr, peer, peer_accept)
+    }
+
+    /// With relay service off, a peer the node dialled cannot open a
+    /// CONNECT-UDP session on it over that link: the request is refused, no
+    /// session is created, and the link itself stays up.
+    #[tokio::test]
+    async fn relay_service_off_refuses_a_dialled_peers_connect_udp() {
+        let (node, node_addr, peer, peer_accept) = node_and_dialled_peer().await;
+        assert!(node.relay_service_allowed(), "allowed by default");
+        node.set_relay_service_allowed(false);
+        assert!(!node.relay_service_allowed());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            peer.inner.setup_proactive_relay(node_addr),
+        )
+        .await
+        .expect("the request does not time out");
+        assert!(
+            result.is_err(),
+            "the relay request must be refused: {result:?}"
+        );
+        assert_eq!(
+            node.inner.relay_server_sessions_created_for_test(),
+            0,
+            "no relay session is created"
+        );
+        assert_eq!(node.inner.relay_server_runtime_metrics().0, 0);
+        assert!(no_client_relay(&peer));
+        let link = node
+            .inner
+            .get_connection(&peer.peer_id())
+            .ok()
+            .flatten()
+            .expect("the dialled link is still there");
+        assert!(link.close_reason().is_none(), "refusing is not hanging up");
+        assert!(!node.relay_service_enabled() && !node.coordinator_service_enabled());
+
+        // Turned back on, the node serves again.
+        node.set_relay_service_allowed(true);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            peer.inner.setup_proactive_relay(node_addr),
+        )
+        .await
+        .expect("setup does not time out")
+        .expect("service allowed again");
+        assert_eq!(node.inner.relay_server_sessions_created_for_test(), 1);
+
+        peer.shutdown().await;
+        node.shutdown().await;
+        peer_accept.abort();
+    }
+
+    /// Turning relay service off ends the relay sessions the node serves.
+    #[tokio::test]
+    async fn turning_relay_service_off_ends_the_sessions_it_serves() {
+        let (node, node_addr, peer, peer_accept) = node_and_dialled_peer().await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            peer.inner.setup_proactive_relay(node_addr),
+        )
+        .await
+        .expect("setup does not time out")
+        .expect("with service allowed the peer gets a session");
+        assert_eq!(node.inner.relay_server_sessions_created_for_test(), 1);
+        wait_until("the node serves the session", || {
+            node.inner.relay_server_runtime_metrics().0 == 1
+        })
+        .await;
+
+        node.set_relay_service_allowed(false);
+        wait_until("the served session ends", || {
+            node.inner.relay_server_runtime_metrics().0 == 0
+        })
+        .await;
+        assert_eq!(node.inner.relay_server_sessions_created_for_test(), 1);
+
+        peer.shutdown().await;
+        node.shutdown().await;
+        peer_accept.abort();
+    }
+
+    /// With relay service off, a node asked to coordinate a hole punch
+    /// between two peers it is connected to refuses: the initiator hears a
+    /// rejection from it and the target hears nothing.
+    #[tokio::test]
+    async fn relay_service_off_refuses_to_coordinate() {
+        let (node, node_addr, node_accepts, node_task) = counting_endpoint().await;
+        node.set_relay_service_allowed(false);
+        let initiator = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let target = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        for peer in [&initiator, &target] {
+            tokio::time::timeout(Duration::from_secs(10), peer.connect_addr(node_addr))
+                .await
+                .expect("connect does not time out")
+                .expect("the peer connects to the node");
+        }
+        wait_until("the node has both links", || {
+            node_accepts.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        let node_id = node.peer_id();
+        let target_id = target.peer_id();
+        let initiator_id = initiator.peer_id();
+        let target_link = || {
+            target
+                .inner
+                .get_connection(&node_id)
+                .ok()
+                .flatten()
+                .expect("the target holds its link to the node")
+        };
+        let punches_before = target_link().stats().frame_rx.punch_me_now;
+
+        initiator
+            .inner
+            .initiate_nat_traversal(target_id, node_addr)
+            .expect("the request is sent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let rejection = loop {
+            if let Some(rejection) =
+                crate::coordinator_control::take_live_rejection(initiator_id, target_id)
+            {
+                break Some(rejection);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let rejection = rejection.expect("the node refuses to coordinate");
+        assert_eq!(rejection.from_peer, Some(node_id));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            target_link().stats().frame_rx.punch_me_now,
+            punches_before,
+            "the target is never asked to punch"
+        );
+
+        initiator.shutdown().await;
+        target.shutdown().await;
+        node.shutdown().await;
+        node_task.abort();
     }
 
     /// A loopback endpoint that counts every inbound connection it accepts,

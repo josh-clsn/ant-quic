@@ -106,7 +106,7 @@ fn generate_test_cert() -> (
     (cert_der, key_der)
 }
 
-fn server_config() -> Arc<ServerConfig> {
+pub(super) fn server_config() -> Arc<ServerConfig> {
     let (cert, key) = generate_test_cert();
     let provider = configured_provider_with_pqc(Some(&PqcConfig::default()));
 
@@ -125,7 +125,7 @@ fn server_config() -> Arc<ServerConfig> {
     Arc::new(config)
 }
 
-fn client_config() -> ClientConfig {
+pub(super) fn client_config() -> ClientConfig {
     let provider = configured_provider_with_pqc(Some(&PqcConfig::default()));
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])

@@ -13,7 +13,7 @@ use super::{Connection, SentFrames, spaces::SentPacket};
 use crate::{
     ConnectionId, Instant, TransportError, TransportErrorCode,
     connection::ConnectionSide,
-    frame::{self, Close},
+    frame::{self, Close, FrameStruct},
     packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
 };
 
@@ -38,7 +38,7 @@ impl PacketBuilder {
     /// Write a new packet header to `buffer` and determine the packet's properties
     ///
     /// Marks the connection drained and returns `None` if the confidentiality limit would be
-    /// violated.
+    /// violated, or an Initial token leaves too little space for frames.
     pub(super) fn new(
         now: Instant,
         space_id: SpaceId,
@@ -165,7 +165,25 @@ impl PacketBuilder {
             buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
             partial_encode.start + dst_cid.len() + 6,
         );
-        let max_size = buffer_capacity - tag_len;
+        let max_size = buffer_capacity.saturating_sub(tag_len);
+        // A Retry or cached token comes from the peer and can take the room frames need.
+        // CRYPTO needs one byte past its bound because its writer checks `< max_size`.
+        let required_frame_space = Ord::max(
+            frame::Crypto::SIZE_BOUND + 1,
+            frame::ConnectionClose::SIZE_BOUND,
+        );
+        if space_id == SpaceId::Initial
+            && (max_size < min_size || max_size.saturating_sub(buffer.len()) < required_frame_space)
+        {
+            buffer.truncate(partial_encode.start);
+            conn.kill(
+                TransportError::PROTOCOL_VIOLATION(
+                    "Initial token leaves insufficient packet space",
+                )
+                .into(),
+            );
+            return None;
+        }
         debug_assert!(max_size >= min_size);
 
         Some(Self {

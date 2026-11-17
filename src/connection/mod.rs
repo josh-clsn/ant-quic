@@ -1008,6 +1008,7 @@ impl Connection {
                 // especially important with ack delay, since the peer might not
                 // have gotten any other ACK for the data earlier on.
                 if !self.spaces[space_id].pending_acks.ranges().is_empty() {
+                    let acks_start = buf.len();
                     if Self::populate_acks(
                         now,
                         self.receiving_ecn,
@@ -1021,16 +1022,15 @@ impl Connection {
                         self.handle_encode_error(now, "ACK (close)");
                         return None;
                     }
+                    // A long Initial token can leave room for CONNECTION_CLOSE but not
+                    // for the ACKs as well. The close matters more.
+                    if buf.len() + frame::ConnectionClose::SIZE_BOUND > builder.max_size {
+                        buf.truncate(acks_start);
+                        self.stats.frame_tx.acks = self.stats.frame_tx.acks.saturating_sub(1);
+                    }
                 }
 
-                // Since there only 64 ACK frames there will always be enough space
-                // to encode the ConnectionClose frame too. However we still have the
-                // check here to prevent crashes if something changes.
-                debug_assert!(
-                    buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size,
-                    "ACKs should leave space for ConnectionClose"
-                );
-                if buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size {
+                if buf.len() + frame::ConnectionClose::SIZE_BOUND <= builder.max_size {
                     let max_frame_size = builder.max_size - buf.len();
                     match self.state {
                         State::Closed(state::Closed { ref reason }) => {
@@ -3133,6 +3133,7 @@ impl Connection {
 
                 if self.total_authed_packets > 1
                             || packet.payload.len() <= 16 // token + 16 byte tag
+                            || packet.payload.len() - 16 > MAX_RETRY_TOKEN_LEN
                             || !self.crypto.is_valid_retry(
                                 &self.rem_cids.active(),
                                 &packet.header_data,
@@ -3147,6 +3148,7 @@ impl Connection {
                     //   field.
                     // - Clients MUST discard Retry packets that have a Retry Integrity Tag
                     //   that cannot be validated
+                    // - A token we would repeat in every Initial must leave room for frames
                     return Ok(());
                 }
 
@@ -6480,6 +6482,13 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
 
+/// Longest Retry token a client keeps
+///
+/// The client repeats the token in every Initial. A token this long still leaves
+/// over 600 bytes for frames in a 1200-byte Initial with the largest header. Our
+/// own Retry tokens are under 100 bytes.
+const MAX_RETRY_TOKEN_LEN: usize = 512;
+
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///
 /// This must be at least as large as the header for a well-formed empty packet to be coalesced,
@@ -7145,6 +7154,10 @@ impl Connection {
 #[cfg(test)]
 #[path = "pqc_mtu_regression_tests.rs"]
 mod pqc_mtu_regression_tests;
+
+#[cfg(test)]
+#[path = "retry_token_tests.rs"]
+mod retry_token_tests;
 
 #[cfg(test)]
 mod tests {

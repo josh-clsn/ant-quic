@@ -141,11 +141,11 @@ pub(super) fn client_config() -> ClientConfig {
     config
 }
 
-struct Peer {
+pub(super) struct Peer {
     endpoint: Endpoint,
-    conn: Option<Connection>,
+    pub(super) conn: Option<Connection>,
     handle: Option<ConnectionHandle>,
-    connected: bool,
+    pub(super) connected: bool,
 }
 
 /// Feed one datagram into `peer`'s endpoint and route everything it produces.
@@ -214,7 +214,10 @@ fn pump(now: crate::Instant, peer: &mut Peer, other: &mut Peer, sizes: &mut Vec<
 
 /// Drive the pair until both report `Connected` or the round budget is exhausted, advancing
 /// the simulated clock by 25 ms whenever a round makes no progress (loss/PTO timers).
-fn drive_to_connected(client: &mut Peer, server: &mut Peer) -> (Vec<usize>, crate::Instant) {
+pub(super) fn drive_to_connected(
+    client: &mut Peer,
+    server: &mut Peer,
+) -> (Vec<usize>, crate::Instant) {
     let mut now = crate::Instant::now();
     let mut sizes = Vec::new();
     for _ in 0..400 {
@@ -238,7 +241,7 @@ fn drive_to_connected(client: &mut Peer, server: &mut Peer) -> (Vec<usize>, crat
     (sizes, now)
 }
 
-fn make_peer_pair() -> (Peer, Peer) {
+pub(super) fn make_peer_pair() -> (Peer, Peer) {
     let server = Peer {
         // allow_mtud = false: no DPLPMTUD probes may authorize >1200-byte datagrams, which
         // is exactly the environment a fragment-filtering path presents pre-validation.

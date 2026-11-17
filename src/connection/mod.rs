@@ -3133,7 +3133,7 @@ impl Connection {
 
                 if self.total_authed_packets > 1
                             || packet.payload.len() <= 16 // token + 16 byte tag
-                            || packet.payload.len() - 16 > MAX_RETRY_TOKEN_LEN
+                            || packet.payload.len() - 16 > MAX_INITIAL_TOKEN_LEN
                             || !self.crypto.is_valid_retry(
                                 &self.rem_cids.active(),
                                 &packet.header_data,
@@ -3685,8 +3685,12 @@ impl Connection {
                     if token.is_empty() {
                         return Err(TransportError::FRAME_ENCODING_ERROR("empty token"));
                     }
-                    trace!("got new token");
-                    token_store.insert(server_name, token);
+                    if token.len() > MAX_INITIAL_TOKEN_LEN {
+                        debug!(len = token.len(), "ignoring an oversized NEW_TOKEN");
+                    } else {
+                        trace!("got new token");
+                        token_store.insert(server_name, token);
+                    }
                 }
                 Frame::Datagram(datagram, frame_len) => {
                     datagram_received = true;
@@ -6244,7 +6248,10 @@ impl From<SideArgs> for ConnectionSide {
                 token_store,
                 server_name,
             } => Self::Client {
-                token: token_store.take(&server_name).unwrap_or_default(),
+                token: token_store
+                    .take(&server_name)
+                    .filter(|token| token.len() <= MAX_INITIAL_TOKEN_LEN)
+                    .unwrap_or_default(),
                 token_store,
                 server_name,
             },
@@ -6482,12 +6489,14 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
 
-/// Longest Retry token a client keeps
+/// Longest peer token, from a Retry or NEW_TOKEN, a client puts in its Initial
 ///
 /// The client repeats the token in every Initial. A token this long still leaves
 /// over 600 bytes for frames in a 1200-byte Initial with the largest header. Our
-/// own Retry tokens are under 100 bytes.
-const MAX_RETRY_TOKEN_LEN: usize = 512;
+/// own Retry tokens are under 100 bytes and NEW_TOKEN tokens under 50. A server
+/// with longer tokens gets no Retry answered (the client times out) and no
+/// NEW_TOKEN kept.
+const MAX_INITIAL_TOKEN_LEN: usize = 512;
 
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///

@@ -26,17 +26,17 @@ use bytes::{Bytes, BytesMut};
 
 use super::{
     ConnectionSide,
-    pqc_mtu_regression_tests::{client_config, server_config},
+    pqc_mtu_regression_tests::{client_config, drive_to_connected, make_peer_pair, server_config},
 };
 use crate::{
     ClientConfig, Connection, ConnectionError, ConnectionId, DEFAULT_SUPPORTED_VERSIONS,
     EndpointConfig, Event, Instant, TransportErrorCode,
     endpoint::{DatagramEvent, Endpoint},
-    packet::{FixedLengthConnectionIdParser, Header, ProtectedHeader, ProtectedInitialHeader},
-};
-use crate::{
-    frame::{self, Frame},
-    packet::{PartialDecode, SpaceId},
+    frame::{self, Frame, NewToken},
+    packet::{
+        FixedLengthConnectionIdParser, Header, Packet, PacketNumber, PartialDecode,
+        ProtectedHeader, ProtectedInitialHeader, SpaceId,
+    },
 };
 
 const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
@@ -131,7 +131,7 @@ fn a_retry_token_that_fits_is_used() {
 
 #[test]
 fn an_oversized_retry_token_is_dropped() {
-    for token_len in [super::MAX_RETRY_TOKEN_LEN + 1, 1000, 1140, 1200, 4000] {
+    for token_len in [super::MAX_INITIAL_TOKEN_LEN + 1, 1000, 1140, 1200, 4000] {
         let (_endpoint, mut conn, now) = deliver_retry(token_len);
         assert!(
             client_token(&conn).is_empty(),
@@ -160,8 +160,8 @@ fn an_oversized_retry_token_is_dropped() {
 
 #[test]
 fn a_retry_token_at_the_cap_is_used() {
-    let (_endpoint, mut conn, now) = deliver_retry(super::MAX_RETRY_TOKEN_LEN);
-    assert_eq!(client_token(&conn).len(), super::MAX_RETRY_TOKEN_LEN);
+    let (_endpoint, mut conn, now) = deliver_retry(super::MAX_INITIAL_TOKEN_LEN);
+    assert_eq!(client_token(&conn).len(), super::MAX_INITIAL_TOKEN_LEN);
     let mut buf = Vec::new();
     let _ = conn
         .poll_transmit(now, 1, &mut buf)
@@ -169,17 +169,68 @@ fn a_retry_token_at_the_cap_is_used() {
     assert!(buf.len() <= crate::MIN_INITIAL_SIZE as usize);
     assert_eq!(
         initial_header(&buf).token_pos.len(),
-        super::MAX_RETRY_TOKEN_LEN
+        super::MAX_INITIAL_TOKEN_LEN
     );
 }
 
-/// A cached NEW_TOKEN token also came from the peer. One that leaves no room
-/// for frames closes the connection instead of breaking the builder.
+/// Connect with `token_len` bytes already set as the Initial token, past every
+/// cap, to reach the packet builder's own check.
+fn connect_with_token(mtu: u16, token_len: usize) -> (Endpoint, Connection) {
+    let mut config = client_config();
+    let mut transport = crate::TransportConfig::default();
+    transport.initial_mtu(mtu);
+    config.transport_config(Arc::new(transport));
+    let (endpoint, mut conn) = connect(config);
+    let ConnectionSide::Client { ref mut token, .. } = conn.side else {
+        panic!("expected a client connection");
+    };
+    *token = vec![0; token_len].into();
+    (endpoint, conn)
+}
+
+/// A token cached from NEW_TOKEN also came from a peer, and any `TokenStore`
+/// (one loaded from disk included) can hand it back. Past the cap it is not
+/// used: the Initial goes out without a token and the connection stays open.
 #[test]
-fn an_oversized_cached_token_closes_the_connection() {
+fn a_cached_token_is_used_only_up_to_the_cap() {
+    for (token_len, used) in [
+        (64, true),
+        (super::MAX_INITIAL_TOKEN_LEN, true),
+        (super::MAX_INITIAL_TOKEN_LEN + 1, false),
+        (1120, false),
+        (1200, false),
+        (4000, false),
+    ] {
+        let config = client_config();
+        config
+            .token_store
+            .insert("localhost", vec![0; token_len].into());
+        let (_endpoint, mut conn) = connect(config);
+        let mut buf = Vec::new();
+        let _ = conn
+            .poll_transmit(Instant::now(), 1, &mut buf)
+            .expect("the client sends its Initial");
+        assert!(
+            buf.len() <= crate::MIN_INITIAL_SIZE as usize,
+            "token {token_len}"
+        );
+        let expected = if used { token_len } else { 0 };
+        assert_eq!(
+            initial_header(&buf).token_pos.len(),
+            expected,
+            "token {token_len}"
+        );
+        assert!(!conn.is_closed(), "token {token_len}");
+        assert!(!lost_to_protocol_violation(&mut conn), "token {token_len}");
+    }
+}
+
+/// The packet builder's backstop: an Initial token that leaves no room for
+/// frames closes the connection instead of breaking the builder.
+#[test]
+fn an_initial_token_without_room_closes_the_connection() {
     for (token_len, mtu, fits) in [
         (0, 1200, true),
-        (512, 1200, true),
         (1119, 1200, true),
         (1120, 1200, false),
         (1140, 1200, false),
@@ -187,14 +238,7 @@ fn an_oversized_cached_token_closes_the_connection() {
         (4000, 1200, false),
         (1200, 1500, true),
     ] {
-        let mut config = client_config();
-        let mut transport = crate::TransportConfig::default();
-        transport.initial_mtu(mtu);
-        config.transport_config(Arc::new(transport));
-        config
-            .token_store
-            .insert("localhost", vec![0; token_len].into());
-        let (_endpoint, mut conn) = connect(config);
+        let (_endpoint, mut conn) = connect_with_token(mtu, token_len);
         let now = Instant::now();
         let mut buf = Vec::new();
         assert_eq!(
@@ -221,7 +265,62 @@ fn an_oversized_cached_token_closes_the_connection() {
     }
 }
 
-/// With a long cached token, an Initial that closes the connection drops its
+/// A peer's NEW_TOKEN over the cap is not stored, and the connection stays
+/// open: it is a policy drop, not a protocol error.
+#[test]
+fn an_oversized_new_token_is_not_stored() {
+    let (mut client, mut server) = make_peer_pair();
+    let (_, now) = drive_to_connected(&mut client, &mut server);
+    assert!(client.connected, "handshake must complete");
+    let conn = client.conn.as_mut().unwrap();
+    let (store, key) = match &conn.side {
+        ConnectionSide::Client {
+            token_store,
+            server_name,
+            ..
+        } => (Arc::clone(token_store), server_name.clone()),
+        ConnectionSide::Server { .. } => panic!("expected a client connection"),
+    };
+    // Whatever the server issued during the handshake is not under test.
+    let _ = store.take(&key);
+    for (number, (token_len, stored)) in [
+        (64, true),
+        (super::MAX_INITIAL_TOKEN_LEN, true),
+        (super::MAX_INITIAL_TOKEN_LEN + 1, false),
+        (1150, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut payload = BytesMut::new();
+        NewToken {
+            token: vec![7; token_len].into(),
+        }
+        .encode(&mut payload);
+        let packet = Packet {
+            header: Header::Short {
+                spin: false,
+                key_phase: false,
+                dst_cid: ConnectionId::new(&[]),
+                number: PacketNumber::U32(0),
+            },
+            header_data: Bytes::new(),
+            payload,
+        };
+        let number = 1_000 + number as u64;
+        conn.spaces[SpaceId::Data].dedup.insert(number);
+        conn.process_payload(now, SERVER_ADDR, number, packet)
+            .expect("a NEW_TOKEN frame is not a protocol error");
+        assert_eq!(
+            store.take(&key).map(|token| token.len()),
+            stored.then_some(token_len),
+            "token {token_len}"
+        );
+        assert!(!conn.is_closed(), "token {token_len}");
+    }
+}
+
+/// With a long Initial token, an Initial that closes the connection drops its
 /// ACKs when they would crowd out CONNECTION_CLOSE.
 #[test]
 fn a_long_initial_token_leaves_room_for_close() {
@@ -235,11 +334,7 @@ fn a_long_initial_token_leaves_room_for_close() {
         (1100, false),
         (1119, false),
     ] {
-        let config = client_config();
-        config
-            .token_store
-            .insert("localhost", vec![0; token_len].into());
-        let (_endpoint, mut conn) = connect(config);
+        let (_endpoint, mut conn) = connect_with_token(1200, token_len);
         let now = Instant::now();
         let keys = conn
             .crypto

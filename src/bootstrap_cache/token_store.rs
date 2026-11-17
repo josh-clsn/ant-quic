@@ -10,10 +10,14 @@
 use crate::bootstrap_cache::BootstrapCache;
 use crate::nat_traversal_api::PeerId;
 use crate::token::TokenStore;
+use crate::token_memory_cache::TokenMemoryCache;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, warn};
+
+/// Most server names whose tokens are kept in memory only
+const MAX_ADDRESSED_SERVER_NAMES: u32 = 256;
 
 /// A TokenStore implementation that persists tokens to the BootstrapCache.
 ///
@@ -23,9 +27,11 @@ use tracing::{debug, warn};
 pub struct BootstrapTokenStore {
     /// Reference to the persistent cache
     cache: Arc<BootstrapCache>,
-    /// Local synchronous cache: ServerName -> Token
-    /// ServerName is expected to be a PeerId hex string or a specific IP Key.
+    /// Local synchronous cache: PeerId hex string -> Token
     local_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Tokens under any other name (a P2P dial's `"peer@<address>"`): not
+    /// persisted, and bounded with the oldest name evicted first
+    addressed: TokenMemoryCache,
 }
 
 impl BootstrapTokenStore {
@@ -50,47 +56,42 @@ impl BootstrapTokenStore {
         Self {
             cache,
             local_cache: Arc::new(RwLock::new(local)),
+            addressed: TokenMemoryCache::new(MAX_ADDRESSED_SERVER_NAMES, 2),
         }
     }
 }
 
+fn peer_id_of(server_name: &str) -> Option<PeerId> {
+    let bytes = hex::decode(server_name).ok()?;
+    <[u8; 32]>::try_from(bytes).ok().map(PeerId)
+}
+
 impl TokenStore for BootstrapTokenStore {
     fn insert(&self, server_name: &str, token: Bytes) {
+        let Some(peer_id) = peer_id_of(server_name) else {
+            debug!(
+                "Received token for non-PeerId server name: {}, not persisting to disk",
+                server_name
+            );
+            self.addressed.insert(server_name, token);
+            return;
+        };
         let token_vec = token.to_vec();
-
-        // 1. Update local cache immediately
         if let Ok(mut local) = self.local_cache.write() {
             local.insert(server_name.to_string(), token_vec.clone());
         } else {
             warn!("Failed to acquire write lock on local token cache");
         }
-
-        // 2. Try to parse server_name as PeerId and update persistent cache
-        // server_name is expected to be hex-encoded PeerId
-        if let Ok(bytes) = hex::decode(server_name) {
-            if let Ok(arr) = <[u8; 32]>::try_from(bytes) {
-                let peer_id = PeerId(arr);
-                let cache = self.cache.clone();
-                let token_clone = token_vec;
-
-                // Spawn async task to update persistent cache
-                tokio::spawn(async move {
-                    cache.update_token(peer_id, token_clone).await;
-                });
-                return;
-            }
-        }
-
-        // If server_name is not a PeerId (e.g. it's an IP), we can't persist it
-        // to a specific Peer entry easily unless we do a reverse lookup.
-        // For now, we only persist tokens if the SNI was the PeerId.
-        debug!(
-            "Received token for non-PeerId server name: {}, not persisting to disk",
-            server_name
-        );
+        let cache = self.cache.clone();
+        tokio::spawn(async move {
+            cache.update_token(peer_id, token_vec).await;
+        });
     }
 
     fn take(&self, server_name: &str) -> Option<Bytes> {
+        if peer_id_of(server_name).is_none() {
+            return self.addressed.take(server_name);
+        }
         if let Ok(mut local) = self.local_cache.write() {
             local.remove(server_name).map(Bytes::from)
         } else {
@@ -261,5 +262,27 @@ mod tests {
             Some(Bytes::from_static(b"second_token")),
             "Should return the most recently inserted token"
         );
+    }
+
+    /// Tokens under a name that is not a PeerId (every P2P dial's
+    /// `"peer@<address>"` key) are not persisted. Their in-memory store is
+    /// bounded, and the oldest name goes first.
+    #[tokio::test]
+    async fn non_peer_id_tokens_are_bounded_and_the_oldest_goes_first() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = create_test_cache(&temp_dir).await;
+        let store = BootstrapTokenStore::new(cache).await;
+
+        let key = |i: u16| format!("peer@127.0.0.1:{}", 10_000 + i);
+        let names = MAX_ADDRESSED_SERVER_NAMES as u16 + 100;
+        for i in 0..names {
+            store.insert(&key(i), Bytes::from(vec![1; 32]));
+        }
+        let kept: Vec<u16> = (0..names)
+            .filter(|&i| store.take(&key(i)).is_some())
+            .collect();
+        assert_eq!(kept.len(), MAX_ADDRESSED_SERVER_NAMES as usize);
+        assert_eq!(kept.first(), Some(&100), "the 100 oldest names are evicted");
+        assert_eq!(kept.last(), Some(&(names - 1)));
     }
 }

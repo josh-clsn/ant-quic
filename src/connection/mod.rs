@@ -3676,7 +3676,7 @@ impl Connection {
                 Frame::NewToken(NewToken { token }) => {
                     let ConnectionSide::Client {
                         token_store,
-                        server_name,
+                        token_key,
                         ..
                     } = &self.side
                     else {
@@ -3689,7 +3689,7 @@ impl Connection {
                         debug!(len = token.len(), "ignoring an oversized NEW_TOKEN");
                     } else {
                         trace!("got new token");
-                        token_store.insert(server_name, token);
+                        token_store.insert(token_key, token);
                     }
                 }
                 Frame::Datagram(datagram, frame_len) => {
@@ -6210,7 +6210,9 @@ enum ConnectionSide {
         /// Sent in every outgoing Initial packet. Always empty after Initial keys are discarded
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
-        server_name: String,
+        /// Where this connection's tokens are stored: one peer's tokens never
+        /// go to another
+        token_key: String,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -6246,14 +6248,14 @@ impl From<SideArgs> for ConnectionSide {
         match side {
             SideArgs::Client {
                 token_store,
-                server_name,
+                token_key,
             } => Self::Client {
                 token: token_store
-                    .take(&server_name)
+                    .take(&token_key)
                     .filter(|token| token.len() <= MAX_INITIAL_TOKEN_LEN)
                     .unwrap_or_default(),
                 token_store,
-                server_name,
+                token_key,
             },
             SideArgs::Server {
                 server_config,
@@ -6268,7 +6270,7 @@ impl From<SideArgs> for ConnectionSide {
 pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
-        server_name: String,
+        token_key: String,
     },
     Server {
         server_config: Arc<ServerConfig>,

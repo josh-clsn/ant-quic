@@ -1021,7 +1021,7 @@ impl Endpoint {
             config.transport,
             SideArgs::Client {
                 token_store: config.token_store,
-                server_name: server_name.into(),
+                token_key: token_key(server_name, remote),
             },
         );
         Ok((ch, conn))
@@ -2185,11 +2185,37 @@ struct FourTuple {
     local_ip: Option<IpAddr>,
 }
 
+/// Where a client keeps the tokens one server gives it
+///
+/// P2P dials all use the server name "peer", so the name alone would hand one
+/// peer's token to the next peer dialled. A 64-hex server name is a PeerId and
+/// already names one peer (`BootstrapTokenStore` persists under it); any other
+/// name is paired with the dialled address.
+fn token_key(server_name: &str, remote: SocketAddr) -> String {
+    if server_name.len() == 64 && server_name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        server_name.to_owned()
+    } else {
+        format!("{server_name}@{remote}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_cid_space_exhausted;
-    use super::{ConnectionHandle, RESET_TOKEN_SIZE, ResetToken, ResetTokenTable};
+    use super::{ConnectionHandle, RESET_TOKEN_SIZE, ResetToken, ResetTokenTable, token_key};
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn a_token_key_pairs_a_shared_name_with_the_dialled_address() {
+        let addr = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9000));
+        assert_eq!(token_key("peer", addr), "peer@192.0.2.1:9000");
+        let peer_id = "ab".repeat(32);
+        assert_eq!(token_key(&peer_id, addr), peer_id);
+        assert_eq!(
+            token_key(&"ab".repeat(31), addr),
+            format!("{}@192.0.2.1:9000", "ab".repeat(31))
+        );
+    }
 
     #[test]
     fn cid_space_check_ignores_zero_and_large_lengths() {

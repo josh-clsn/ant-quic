@@ -76,6 +76,10 @@ impl TokenLog for NoneTokenLog {
 
 /// Responsible for storing validation tokens received from servers and retrieving them for use in
 /// subsequent connections
+///
+/// The `server_name` passed in is the dial's server name paired with the dialled address
+/// (`"peer@192.0.2.1:9000"`), so one peer's token never goes to another. A 64-hex server name
+/// (a PeerId) is passed as it is.
 pub trait TokenStore: Send + Sync {
     /// Potentially store a token for later one-time use
     ///

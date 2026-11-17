@@ -202,9 +202,10 @@ fn a_cached_token_is_used_only_up_to_the_cap() {
         (4000, false),
     ] {
         let config = client_config();
-        config
-            .token_store
-            .insert("localhost", vec![0; token_len].into());
+        config.token_store.insert(
+            &format!("localhost@{SERVER_ADDR}"),
+            vec![0; token_len].into(),
+        );
         let (_endpoint, mut conn) = connect(config);
         let mut buf = Vec::new();
         let _ = conn
@@ -276,9 +277,9 @@ fn an_oversized_new_token_is_not_stored() {
     let (store, key) = match &conn.side {
         ConnectionSide::Client {
             token_store,
-            server_name,
+            token_key,
             ..
-        } => (Arc::clone(token_store), server_name.clone()),
+        } => (Arc::clone(token_store), token_key.clone()),
         ConnectionSide::Server { .. } => panic!("expected a client connection"),
     };
     // Whatever the server issued during the handshake is not under test.
@@ -292,25 +293,7 @@ fn an_oversized_new_token_is_not_stored() {
     .into_iter()
     .enumerate()
     {
-        let mut payload = BytesMut::new();
-        NewToken {
-            token: vec![7; token_len].into(),
-        }
-        .encode(&mut payload);
-        let packet = Packet {
-            header: Header::Short {
-                spin: false,
-                key_phase: false,
-                dst_cid: ConnectionId::new(&[]),
-                number: PacketNumber::U32(0),
-            },
-            header_data: Bytes::new(),
-            payload,
-        };
-        let number = 1_000 + number as u64;
-        conn.spaces[SpaceId::Data].dedup.insert(number);
-        conn.process_payload(now, SERVER_ADDR, number, packet)
-            .expect("a NEW_TOKEN frame is not a protocol error");
+        deliver_new_token(conn, now, 1_000 + number as u64, token_len);
         assert_eq!(
             store.take(&key).map(|token| token.len()),
             stored.then_some(token_len),
@@ -386,4 +369,60 @@ fn a_long_initial_token_leaves_room_for_close() {
             "token {token_len}: {frames:?}"
         );
     }
+}
+
+fn deliver_new_token(conn: &mut Connection, now: Instant, number: u64, token_len: usize) {
+    let mut payload = BytesMut::new();
+    NewToken {
+        token: vec![7; token_len].into(),
+    }
+    .encode(&mut payload);
+    let packet = Packet {
+        header: Header::Short {
+            spin: false,
+            key_phase: false,
+            dst_cid: ConnectionId::new(&[]),
+            number: PacketNumber::U32(0),
+        },
+        header_data: Bytes::new(),
+        payload,
+    };
+    conn.spaces[SpaceId::Data].dedup.insert(number);
+    conn.process_payload(now, SERVER_ADDR, number, packet)
+        .expect("a NEW_TOKEN frame is not a protocol error");
+}
+
+/// P2P dials all use the server name "peer". A token one peer issued must not
+/// go to another peer behind the same name.
+#[test]
+fn a_token_from_one_peer_is_not_offered_to_another() {
+    let peer_a = SERVER_ADDR;
+    let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4434);
+    let config = client_config();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let now = Instant::now();
+    let initial_token_len = |endpoint: &mut Endpoint, remote: SocketAddr| {
+        let (_, mut conn) = endpoint
+            .connect(now, config.clone(), remote, "peer")
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = conn.poll_transmit(now, 1, &mut buf).unwrap();
+        initial_header(&buf).token_pos.len()
+    };
+
+    let (_, mut to_a) = endpoint
+        .connect(now, config.clone(), peer_a, "peer")
+        .unwrap();
+    deliver_new_token(&mut to_a, now, 1_000, 64);
+
+    assert_eq!(
+        initial_token_len(&mut endpoint, peer_b),
+        0,
+        "peer B must not get A's token"
+    );
+    assert_eq!(
+        initial_token_len(&mut endpoint, peer_a),
+        64,
+        "peer A gets its own token back"
+    );
 }

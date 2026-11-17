@@ -10,9 +10,11 @@
 //!
 //! The client puts the token from a Retry, or one cached from NEW_TOKEN, in the
 //! header of every Initial. A token that leaves no room in a 1200-byte Initial
-//! made `PacketBuilder::new` compute a minimum size above the maximum: a debug
-//! build panicked and a release build tried a huge allocation. Anyone who sees
-//! the client's first Initial can forge the Retry.
+//! made `PacketBuilder::new` compute a minimum size above the maximum, which
+//! only a `debug_assert` checked: a debug build panicked there, and a release
+//! build went on with an impossible size (in quinn-proto it tried an allocation
+//! of over 10 GiB; ant-quic's release behaviour was not measured). Anyone who
+//! sees the client's first Initial can forge the Retry.
 
 use std::{
     io::Cursor,

@@ -2159,4 +2159,25 @@ mod tests {
         assert_eq!(server.local_max_data, expected_local_max_data);
         assert!(should_transmit.should_transmit());
     }
+
+    /// RUSTSEC-2026-0523 (quinn-proto `max_stream_data_over_stream_limit`):
+    /// MAX_STREAM_DATA or STOP_SENDING naming a peer stream past the limit must
+    /// not open it and every stream below it.
+    #[test]
+    fn max_stream_data_over_stream_limit() {
+        let mut server = make(Side::Server);
+        // The limit is 128 streams, so the client may open the streams 0 to 127.
+        for index in [128, 1 << 40] {
+            let id = StreamId::new(Side::Client, Dir::Bi, index);
+            let _ = server.received_max_stream_data(id, 1);
+            server.received_stop_sending(id, 0u32.into());
+            assert_eq!(server.next_remote[Dir::Bi as usize], 0, "stream {index}");
+            assert!(server.recv.is_empty(), "stream {index}");
+            assert!(server.send.is_empty(), "stream {index}");
+        }
+
+        let last = StreamId::new(Side::Client, Dir::Bi, 127);
+        server.received_max_stream_data(last, 1).unwrap();
+        assert_eq!(server.next_remote[Dir::Bi as usize], 128);
+    }
 }

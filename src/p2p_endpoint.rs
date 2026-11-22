@@ -1335,6 +1335,14 @@ where
     None
 }
 
+/// The whole direct pre-pass of a connect under
+/// [`CoordinatorPolicy::Introducer`] (a check-in burst): every candidate
+/// address shares it, so a silent announced address cannot hold the connect
+/// past the time an embedder waits for the introducer and the punch. The
+/// fallback ladder's own direct stage still races the target's addresses
+/// after it.
+const INTRODUCER_DIRECT_PREPASS_BUDGET: Duration = Duration::from_secs(2);
+
 /// Budget for the direct (Happy Eyeballs) stage of the fallback ladder.
 ///
 /// The adaptive direct budget (`configured_timeout`, 4 x RTT + 750 ms) is a
@@ -4424,9 +4432,29 @@ impl P2pEndpoint {
         Ok(None)
     }
 
+    #[cfg(test)]
     async fn attempt_direct_handshake(
         &self,
         addr: SocketAddr,
+    ) -> Result<crate::high_level::Connection, EndpointError> {
+        // Enforce a hard timeout on the QUIC handshake to prevent the 76s hang
+        // reported in issue #137. The connection_timeout config or 30s default
+        // ensures callers always get a response within a bounded window.
+        let handshake_timeout = self
+            .config
+            .timeouts
+            .nat_traversal
+            .connection_establishment_timeout;
+        self.attempt_direct_handshake_within(addr, handshake_timeout)
+            .await
+    }
+
+    /// [`Self::attempt_direct_handshake`] with the handshake bounded by
+    /// `handshake_timeout`.
+    async fn attempt_direct_handshake_within(
+        &self,
+        addr: SocketAddr,
+        handshake_timeout: Duration,
     ) -> Result<crate::high_level::Connection, EndpointError> {
         info!("Connecting directly to {}", addr);
 
@@ -4439,14 +4467,6 @@ impl P2pEndpoint {
             .connect(addr, "peer")
             .map_err(|e| EndpointError::Connection(e.to_string()))?;
 
-        // Enforce a hard timeout on the QUIC handshake to prevent the 76s hang
-        // reported in issue #137. The connection_timeout config or 30s default
-        // ensures callers always get a response within a bounded window.
-        let handshake_timeout = self
-            .config
-            .timeouts
-            .nat_traversal
-            .connection_establishment_timeout;
         match timeout(handshake_timeout, connecting).await {
             Ok(Ok(conn)) => Ok(conn),
             Ok(Err(e)) => {
@@ -4472,11 +4492,30 @@ impl P2pEndpoint {
         addr: SocketAddr,
         hint_peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
+        let handshake_timeout = self
+            .config
+            .timeouts
+            .nat_traversal
+            .connection_establishment_timeout;
+        self.connect_direct_addr_with_hint_within(addr, hint_peer_id, handshake_timeout)
+            .await
+    }
+
+    /// [`Self::connect_direct_addr_with_hint`] with the handshake bounded by
+    /// `handshake_timeout`.
+    async fn connect_direct_addr_with_hint_within(
+        &self,
+        addr: SocketAddr,
+        hint_peer_id: Option<PeerId>,
+        handshake_timeout: Duration,
+    ) -> Result<PeerConnection, EndpointError> {
         if let Some(existing) = self.prepare_direct_addr_attempt(addr).await? {
             return Ok(existing);
         }
 
-        let connection = self.attempt_direct_handshake(addr).await?;
+        let connection = self
+            .attempt_direct_handshake_within(addr, handshake_timeout)
+            .await?;
         self.finalize_direct_connection(connection, addr, hint_peer_id)
             .await
     }
@@ -4601,19 +4640,38 @@ impl P2pEndpoint {
         }
     }
 
+    /// Try each address in turn. With `deadline`, every handshake ends by
+    /// it and no attempt starts after it.
     async fn connect_direct_candidates(
         &self,
         addrs: &[SocketAddr],
         hint_peer_id: Option<PeerId>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<PeerConnection, EndpointError> {
         // Explicit address hints often include multiple viable local-network,
         // overlay, and global candidates. Truncating to the first few can miss
         // the only actually reachable path, for example when bridge/ULA addrs
         // appear before a working Tailscale or secondary LAN address.
+        let configured = self
+            .config
+            .timeouts
+            .nat_traversal
+            .connection_establishment_timeout;
         let mut last_err: Option<EndpointError> = None;
         for addr in addrs {
+            let handshake_timeout = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        last_err.get_or_insert(EndpointError::Timeout);
+                        break;
+                    }
+                    remaining.min(configured)
+                }
+                None => configured,
+            };
             match self
-                .connect_direct_addr_with_hint(*addr, hint_peer_id)
+                .connect_direct_addr_with_hint_within(*addr, hint_peer_id, handshake_timeout)
                 .await
             {
                 Ok(conn) => return Ok(conn),
@@ -4844,8 +4902,14 @@ impl P2pEndpoint {
         drop_non_global_direct_candidates_when_global_present(&mut explicit_addrs);
 
         if !explicit_addrs.is_empty() && !is_simple_address_only {
+            // A burst dial (`Introducer`) keeps its direct pre-pass short, so
+            // the ladder reaches the introducer and the punch while the
+            // embedder still waits for the connect.
+            let prepass_deadline = (self.inner.coordinator_policy()
+                == CoordinatorPolicy::Introducer)
+                .then(|| tokio::time::Instant::now() + INTRODUCER_DIRECT_PREPASS_BUDGET);
             match self
-                .connect_direct_candidates(&explicit_addrs, peer_id)
+                .connect_direct_candidates(&explicit_addrs, peer_id, prepass_deadline)
                 .await
             {
                 Ok(conn) => return Ok(conn),
@@ -17220,6 +17284,59 @@ mod tests {
 
         drop(silent);
         client.shutdown().await;
+        seed.shutdown().await;
+        seed_task.abort();
+    }
+
+    /// A burst connect to a target whose announced address is silent reaches
+    /// it through the punch while the caller still waits: the direct
+    /// pre-pass is bounded under `Introducer`, so the ladder gets to the
+    /// introducer (here the seed fallback, which the target is connected to)
+    /// well inside the budget an embedder gives a check-in dial.
+    #[tokio::test]
+    async fn a_burst_reaches_a_silent_target_through_the_punch_quickly() {
+        let (seed, seed_addr, seed_accepts, seed_task) = counting_endpoint().await;
+        let target = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let target_accept = tokio::spawn({
+            let target = target.clone();
+            async move { while target.accept().await.is_some() {} }
+        });
+        tokio::time::timeout(Duration::from_secs(10), target.connect_addr(seed_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("the target reaches the seed");
+        wait_until("the seed holds the target's link", || {
+            seed_accepts.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let client = loopback_endpoint_with(|builder| builder.known_peer(seed_addr)).await;
+        let client_accept = tokio::spawn({
+            let client = client.clone();
+            async move { while client.accept().await.is_some() {} }
+        });
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+
+        let (silent, silent_addr) = silent_target();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            client.connect_peer_with_addrs(target.peer_id(), vec![silent_addr]),
+        )
+        .await
+        .expect("the burst connect reaches the punch within 8 s");
+        let connection = result.expect("the punch reaches the target");
+        assert_eq!(connection.peer_id, target.peer_id());
+        assert_eq!(connection.traversal_method, TraversalMethod::HolePunch);
+        assert!(started.elapsed() < Duration::from_secs(8));
+        let stats = client.introducer_stats();
+        assert_eq!((stats.dials, stats.known_peer_dials), (1, 1), "{stats:?}");
+
+        drop(silent);
+        client_accept.abort();
+        target_accept.abort();
+        client.shutdown().await;
+        target.shutdown().await;
         seed.shutdown().await;
         seed_task.abort();
     }

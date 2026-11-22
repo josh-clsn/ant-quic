@@ -6025,10 +6025,11 @@ impl P2pEndpoint {
                 // joined, so its hang-up waits for this connect's punch.
                 introducer = IntroducerGuard::shared(self, coordinator);
             } else if let Some(target_peer) = peer_id.filter(|peer| !is_synthetic_peer_id(peer)) {
-                // No live coordinator: this target may use one introducer per
-                // budget, its own hints first, then known peers. One that
-                // another connect holds is joined first; one being hung up on
-                // is skipped.
+                // No live coordinator: this target may reach at most one
+                // introducer per budget, its own hints first, then known
+                // peers (an unreachable one gives way to the next in the
+                // punch stage). One that another connect holds is joined
+                // first; one being hung up on is skipped.
                 let choice = self.next_introducer(target_peer, [target_ipv4, target_ipv6], &[]);
                 // Hold first, then spend: a hold refused (the introducer
                 // turned closing) leaves the target's budget unspent, and a
@@ -6038,7 +6039,7 @@ impl P2pEndpoint {
                     && self.inner.spend_introducer(target_peer)
                 {
                     info!(
-                        "Using introducer {} for {:?} (one per target per budget)",
+                        "Using introducer {} for {:?} (at most one reached per target per budget)",
                         choice, target_peer
                     );
                     config.coordinator = Some(choice);
@@ -11550,7 +11551,8 @@ impl P2pEndpoint {
         self.inner.peer_introducers(peer)
     }
 
-    /// Let every target use one introducer again (a new burst).
+    /// Start a new introducer budget (a new burst): every target may reach
+    /// an introducer again.
     pub fn reset_introducer_budget(&self) {
         self.inner.reset_introducer_budget();
     }

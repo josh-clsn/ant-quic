@@ -1622,13 +1622,17 @@ pub enum CoordinatorPolicy {
     /// peer-id-only connect dials no known peer.
     ConnectedOnly = 1,
     /// As [`Self::ConnectedOnly`], except that a connect to a target may
-    /// dial one introducer: first one the target named for itself
-    /// ([`NatTraversalEndpoint::set_peer_introducers`]), else a known peer.
-    /// Each target gets one per budget
-    /// ([`NatTraversalEndpoint::reset_introducer_budget`]), and the
-    /// introducer connection is closed as soon as the punch resolves,
-    /// success or failure. Introducers only coordinate; with relay fallback
-    /// off they never carry data.
+    /// dial introducers: first the ones the target named for itself
+    /// ([`NatTraversalEndpoint::set_peer_introducers`]), then known peers
+    /// when allowed, also after the named ones fail. At most one introducer
+    /// that is reached (and so learns the target) per target per budget
+    /// ([`NatTraversalEndpoint::reset_introducer_budget`]): an unreachable
+    /// one is skipped within 3 s while another candidate is left, the last
+    /// candidate gets the punch stage's remaining time, and none is dialled
+    /// twice for the same target in one connect. The introducer connection
+    /// is closed as soon as the punch resolves, success or failure.
+    /// Introducers only coordinate; with relay fallback off they never
+    /// carry data.
     Introducer = 2,
 }
 
@@ -1887,7 +1891,7 @@ pub struct NatTraversalEndpoint {
     /// Per target: the introducers it named for itself (its own hints),
     /// tried first under [`CoordinatorPolicy::Introducer`].
     introducer_hints: ParkingMutex<IntroducerHintTable>,
-    /// Targets that used their one introducer since the last
+    /// Targets that spent their introducer budget since the last
     /// [`NatTraversalEndpoint::reset_introducer_budget`].
     introducer_spent: ParkingMutex<HashSet<PeerId>>,
     /// The embedder's own peers ([`NatTraversalEndpoint::set_own_peers`]):
@@ -8311,7 +8315,8 @@ impl NatTraversalEndpoint {
         self.introducer_hints_for(peer)
     }
 
-    /// Let every target use one introducer again (a new burst).
+    /// Start a new introducer budget (a new burst): every target may reach
+    /// an introducer again.
     pub fn reset_introducer_budget(&self) {
         self.introducer_spent.lock().clear();
     }
@@ -8352,8 +8357,9 @@ impl NatTraversalEndpoint {
         self.own_peers.lock().contains(peer)
     }
 
-    /// Spend `peer`'s one introducer for this budget. Returns false when it
-    /// was already spent.
+    /// Spend `peer`'s introducer budget (the connect that picks an
+    /// introducer for it; an unreachable one gives way to the next within
+    /// that connect). Returns false when it was already spent.
     pub(crate) fn spend_introducer(&self, peer: PeerId) -> bool {
         self.introducer_spent.lock().insert(peer)
     }

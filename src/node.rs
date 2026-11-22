@@ -615,7 +615,8 @@ impl Node {
         self.inner.peer_introducers(peer)
     }
 
-    /// Let every target use one introducer again (a new burst).
+    /// Start a new introducer budget (a new burst): every target may reach
+    /// an introducer again.
     pub fn reset_introducer_budget(&self) {
         self.inner.reset_introducer_budget();
     }

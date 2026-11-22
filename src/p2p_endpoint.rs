@@ -1344,8 +1344,10 @@ where
 const INTRODUCER_DIRECT_PREPASS_BUDGET: Duration = Duration::from_secs(2);
 
 /// The most a burst connect's dial to one introducer may take (within the
-/// punch stage's own deadline): a stale introducer then fails fast, and the
-/// target's next introducer can still be tried inside the embedder's wait.
+/// punch stage's own deadline) while another introducer is left to try: a
+/// stale introducer then fails fast, and the target's next introducer can
+/// still be tried inside the embedder's wait. The last one left gets the
+/// stage's remaining budget.
 const INTRODUCER_DIAL_BUDGET: Duration = Duration::from_secs(3);
 
 /// One hole-punch round through an introducer. It counts as a failure
@@ -4503,6 +4505,14 @@ impl P2pEndpoint {
             .connect(addr, "peer")
             .map_err(|e| EndpointError::Connection(e.to_string()))?;
 
+        #[cfg(test)]
+        let connecting = {
+            let delay = self.inner.handshake_delay_for_test(addr);
+            async move {
+                tokio::time::sleep(delay).await;
+                connecting.await
+            }
+        };
         match timeout(handshake_timeout, connecting).await {
             Ok(Ok(conn)) => Ok(conn),
             Ok(Err(e)) => {
@@ -6464,12 +6474,22 @@ impl P2pEndpoint {
                         self.inner.record_introducer_dial(!named);
                     }
                     // A burst's introducer dial gets a short share of the
-                    // burst, so a stale introducer fails fast and the next
-                    // one can still be tried.
+                    // burst when another introducer is left to try, so a
+                    // stale one fails fast and gives way. The last one left
+                    // gets the stage's whole remaining budget.
                     let dial_budget = (policy == CoordinatorPolicy::Introducer).then(|| {
-                        INTRODUCER_DIAL_BUDGET.min(
-                            stage_deadline.saturating_duration_since(tokio::time::Instant::now()),
-                        )
+                        let remaining =
+                            stage_deadline.saturating_duration_since(tokio::time::Instant::now());
+                        let mut tried = failed_introducers.clone();
+                        tried.push(coordinator);
+                        let another_left = self
+                            .next_introducer(target_peer_id, [target_ipv4, target_ipv6], &tried)
+                            .is_some();
+                        if another_left {
+                            INTRODUCER_DIAL_BUDGET.min(remaining)
+                        } else {
+                            remaining
+                        }
                     });
                     let started = self
                         .start_hole_punch_session(
@@ -17530,6 +17550,43 @@ mod tests {
         assert!(stats.punch_failures >= 1, "the stale round: {stats:?}");
 
         drop((stale, silent));
+        client_accept.abort();
+        target_accept.abort();
+        client.shutdown().await;
+        target.shutdown().await;
+        good.shutdown().await;
+        good_task.abort();
+    }
+
+    /// The last introducer left is not cut at the 3 s share: a working one
+    /// whose handshake takes longer (a lossy path) still gets the punch.
+    #[tokio::test]
+    async fn the_only_introducer_gets_the_whole_stage() {
+        let (good, good_addr, good_accepts, good_task) = counting_endpoint().await;
+        let (target, target_accept, client, client_accept) =
+            burst_to_target_behind(good_addr).await;
+        wait_until("the introducer holds the target's link", || {
+            good_accepts.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        client.set_peer_introducers(target.peer_id(), vec![good_addr]);
+        client
+            .inner
+            .delay_handshakes_for_test(good_addr, Duration::from_millis(3500));
+
+        let (silent, silent_addr) = silent_target();
+        let connection = tokio::time::timeout(
+            Duration::from_secs(12),
+            client.connect_peer_with_addrs(target.peer_id(), vec![silent_addr]),
+        )
+        .await
+        .expect("the burst reaches the target inside 12 s")
+        .expect("the slow introducer's punch reaches the target");
+        assert_eq!(connection.traversal_method, TraversalMethod::HolePunch);
+        let stats = client.introducer_stats();
+        assert_eq!((stats.dials, stats.punch_successes), (1, 1), "{stats:?}");
+
+        drop(silent);
         client_accept.abort();
         target_accept.abort();
         client.shutdown().await;

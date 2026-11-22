@@ -1917,6 +1917,10 @@ pub struct NatTraversalEndpoint {
     introducer_test_fail_hold: ParkingMutex<HashSet<SocketAddr>>,
     #[cfg(test)]
     introducer_test_fail_dial: ParkingMutex<HashSet<SocketAddr>>,
+    /// Test seam: a direct handshake to one of these addresses takes at
+    /// least this long (a lossy path).
+    #[cfg(test)]
+    handshake_test_delay: ParkingMutex<HashMap<SocketAddr, std::time::Duration>>,
     #[cfg(test)]
     introducer_test_waits_cut_short: AtomicU64,
     #[cfg(test)]
@@ -3361,6 +3365,8 @@ impl NatTraversalEndpoint {
             #[cfg(test)]
             introducer_test_fail_dial: ParkingMutex::new(HashSet::new()),
             #[cfg(test)]
+            handshake_test_delay: ParkingMutex::new(HashMap::new()),
+            #[cfg(test)]
             introducer_test_waits_cut_short: AtomicU64::new(0),
             #[cfg(test)]
             introducer_hangups: AtomicU64::new(0),
@@ -3930,6 +3936,8 @@ impl NatTraversalEndpoint {
             introducer_test_fail_hold: ParkingMutex::new(HashSet::new()),
             #[cfg(test)]
             introducer_test_fail_dial: ParkingMutex::new(HashSet::new()),
+            #[cfg(test)]
+            handshake_test_delay: ParkingMutex::new(HashMap::new()),
             #[cfg(test)]
             introducer_test_waits_cut_short: AtomicU64::new(0),
             #[cfg(test)]
@@ -8447,6 +8455,20 @@ impl NatTraversalEndpoint {
     #[cfg(test)]
     pub(crate) fn introducer_dial_fails_for_test(&self, addr: SocketAddr) -> bool {
         self.introducer_test_fail_dial.lock().contains(&addr)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_handshakes_for_test(&self, addr: SocketAddr, delay: std::time::Duration) {
+        self.handshake_test_delay.lock().insert(addr, delay);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handshake_delay_for_test(&self, addr: SocketAddr) -> std::time::Duration {
+        self.handshake_test_delay
+            .lock()
+            .get(&addr)
+            .copied()
+            .unwrap_or_default()
     }
 
     #[cfg(test)]

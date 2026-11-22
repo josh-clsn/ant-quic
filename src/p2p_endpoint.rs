@@ -6365,13 +6365,12 @@ impl P2pEndpoint {
                     .min(now + strategy.holepunch_timeout());
 
                     punch_started = true;
+                    let via_introducer = introducer
+                        .as_ref()
+                        .is_some_and(|guard| guard.addr == coordinator);
                     let mut may_dial_coordinator = policy == CoordinatorPolicy::Any;
                     let mut dialling_introducer = false;
-                    if policy == CoordinatorPolicy::Introducer
-                        && introducer
-                            .as_ref()
-                            .is_some_and(|guard| guard.addr == coordinator)
-                    {
+                    if policy == CoordinatorPolicy::Introducer && via_introducer {
                         // The first holder to reach its punch while the
                         // introducer is not connected dials it; the others
                         // wait for that connection, up to this stage's own
@@ -6424,12 +6423,18 @@ impl P2pEndpoint {
                         {
                             Ok(conn) => {
                                 info!("✓ Hole-punch succeeded to {} via {}", target, coordinator);
+                                if via_introducer {
+                                    self.inner.record_introducer_punch(true);
+                                }
                                 if let Some(guard) = introducer.take() {
                                     guard.finish().await;
                                 }
                                 return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
                             }
                             Err(error) => {
+                                if via_introducer {
+                                    self.inner.record_introducer_punch(false);
+                                }
                                 let retryable = strategy.should_retry_holepunch()
                                     && error
                                         .retry_reason()
@@ -6450,6 +6455,9 @@ impl P2pEndpoint {
                             }
                         },
                         Err(e) => {
+                            if via_introducer {
+                                self.inner.record_introducer_punch(false);
+                            }
                             let retryable = strategy.should_retry_holepunch()
                                 && match &e {
                                     EndpointError::NatTraversal(error) => {
@@ -16724,6 +16732,8 @@ mod tests {
             stats.bytes_sent > 0 && stats.bytes_received > 0,
             "{stats:?}"
         );
+        assert_eq!(stats.punch_successes, 0, "{stats:?}");
+        assert!(stats.punch_failures >= 1, "the punch failed: {stats:?}");
         let introducer_id = introducer.peer_id();
         wait_until("the introducer connection is closed", || {
             client
@@ -17331,6 +17341,11 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(8));
         let stats = client.introducer_stats();
         assert_eq!((stats.dials, stats.known_peer_dials), (1, 1), "{stats:?}");
+        assert_eq!(
+            (stats.punch_successes, stats.punch_failures),
+            (1, 0),
+            "{stats:?}"
+        );
 
         drop(silent);
         client_accept.abort();

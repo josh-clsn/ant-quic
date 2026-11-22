@@ -1668,6 +1668,12 @@ pub struct IntroducerStats {
     pub bytes_sent: u64,
     /// UDP bytes received on them, counted when each was closed.
     pub bytes_received: u64,
+    /// Hole-punch rounds run through an introducer that reached the target.
+    pub punch_successes: u64,
+    /// Hole-punch rounds run through an introducer that did not: the
+    /// coordination was refused or timed out, or the punch never started
+    /// (the introducer could not be reached).
+    pub punch_failures: u64,
 }
 
 /// A snapshot of an endpoint's client relay sessions
@@ -1888,6 +1894,8 @@ pub struct NatTraversalEndpoint {
     own_peers: ParkingMutex<HashSet<PeerId>>,
     introducer_dials: AtomicU64,
     introducer_known_peer_dials: AtomicU64,
+    introducer_punch_successes: AtomicU64,
+    introducer_punch_failures: AtomicU64,
     /// Whether a target with no introducer of its own may use a known peer
     /// (bootstrap seed) as its introducer.
     known_peer_introducers_allowed: AtomicBool,
@@ -3338,6 +3346,8 @@ impl NatTraversalEndpoint {
             own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
             introducer_known_peer_dials: AtomicU64::new(0),
+            introducer_punch_successes: AtomicU64::new(0),
+            introducer_punch_failures: AtomicU64::new(0),
             known_peer_introducers_allowed: AtomicBool::new(true),
             introducer_refs: ParkingMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -3906,6 +3916,8 @@ impl NatTraversalEndpoint {
             own_peers: ParkingMutex::new(HashSet::new()),
             introducer_dials: AtomicU64::new(0),
             introducer_known_peer_dials: AtomicU64::new(0),
+            introducer_punch_successes: AtomicU64::new(0),
+            introducer_punch_failures: AtomicU64::new(0),
             known_peer_introducers_allowed: AtomicBool::new(true),
             introducer_refs: ParkingMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -8571,6 +8583,17 @@ impl NatTraversalEndpoint {
         }
     }
 
+    /// One hole-punch round through an introducer ended: reached the
+    /// target or not.
+    pub(crate) fn record_introducer_punch(&self, reached: bool) {
+        let counter = if reached {
+            &self.introducer_punch_successes
+        } else {
+            &self.introducer_punch_failures
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_introducer_bytes(&self, sent: u64, received: u64) {
         self.introducer_bytes_sent
             .fetch_add(sent, Ordering::Relaxed);
@@ -8578,14 +8601,17 @@ impl NatTraversalEndpoint {
             .fetch_add(received, Ordering::Relaxed);
     }
 
-    /// Introducer connections dialled under [`CoordinatorPolicy::Introducer`]
-    /// and the UDP bytes they carried, counted when each was closed.
+    /// Introducer connections dialled under [`CoordinatorPolicy::Introducer`],
+    /// the UDP bytes they carried (counted when each was closed) and how the
+    /// punches run through them ended.
     pub fn introducer_stats(&self) -> IntroducerStats {
         IntroducerStats {
             dials: self.introducer_dials.load(Ordering::Relaxed),
             known_peer_dials: self.introducer_known_peer_dials.load(Ordering::Relaxed),
             bytes_sent: self.introducer_bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.introducer_bytes_received.load(Ordering::Relaxed),
+            punch_successes: self.introducer_punch_successes.load(Ordering::Relaxed),
+            punch_failures: self.introducer_punch_failures.load(Ordering::Relaxed),
         }
     }
 

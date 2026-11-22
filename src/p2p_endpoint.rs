@@ -11585,6 +11585,17 @@ impl P2pEndpoint {
         self.inner.introducer_stats()
     }
 
+    /// Whether a burst connect holds the introducer at `addr` now (from
+    /// when it picks it until the hang-up after its punch). An embedder that
+    /// closes links it did not book uses this to leave a punch's introducer
+    /// up.
+    pub fn holds_introducer_at(&self, addr: SocketAddr) -> bool {
+        self.inner.introducer_is_held(addr)
+            || self
+                .inner
+                .introducer_is_held(crate::shared::normalize_socket_addr(addr))
+    }
+
     /// The peer and the current connection's stable id at `addr`.
     async fn connection_at_addr(&self, addr: SocketAddr) -> Option<(PeerId, usize)> {
         let peer = {
@@ -17622,6 +17633,20 @@ mod tests {
         assert!(stats.punch_failures >= 1, "{stats:?}");
 
         drop((stale, silent));
+        client.shutdown().await;
+    }
+
+    /// `holds_introducer_at` is true while a connect holds the introducer
+    /// and false once it lets go.
+    #[tokio::test]
+    async fn holds_introducer_at_follows_the_hold() {
+        let client = loopback_endpoint_with(|builder| builder).await;
+        let addr: SocketAddr = "127.0.0.1:9107".parse().expect("addr");
+        assert!(!client.holds_introducer_at(addr));
+        let guard = IntroducerGuard::hold(&client, addr).expect("hold");
+        assert!(client.holds_introducer_at(addr));
+        guard.finish().await;
+        assert!(!client.holds_introducer_at(addr));
         client.shutdown().await;
     }
 

@@ -1659,7 +1659,8 @@ struct IntroducerEntry {
 /// Introducer use under [`CoordinatorPolicy::Introducer`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IntroducerStats {
-    /// Introducer connections dialled.
+    /// Introducer dials, each counted when it starts (whether it connects
+    /// or not).
     pub dials: u64,
     /// Of those, dials to an introducer the target did not name for itself:
     /// a known peer (bootstrap seed) taken as the fallback.
@@ -1671,8 +1672,9 @@ pub struct IntroducerStats {
     /// Hole-punch rounds run through an introducer that reached the target.
     pub punch_successes: u64,
     /// Hole-punch rounds run through an introducer that did not: the
-    /// coordination was refused or timed out, or the punch never started
-    /// (the introducer could not be reached).
+    /// coordination was refused or timed out, the punch never started (the
+    /// introducer could not be reached), or the connect was dropped before
+    /// the round resolved.
     pub punch_failures: u64,
 }
 

@@ -1343,6 +1343,42 @@ where
 /// after it.
 const INTRODUCER_DIRECT_PREPASS_BUDGET: Duration = Duration::from_secs(2);
 
+/// The most a burst connect's dial to one introducer may take (within the
+/// punch stage's own deadline): a stale introducer then fails fast, and the
+/// target's next introducer can still be tried inside the embedder's wait.
+const INTRODUCER_DIAL_BUDGET: Duration = Duration::from_secs(3);
+
+/// One hole-punch round through an introducer. It counts as a failure
+/// unless it is finished as a success, so a round left unresolved because
+/// its connect was dropped still shows in [`IntroducerStats`].
+///
+/// [`IntroducerStats`]: crate::nat_traversal_api::IntroducerStats
+struct IntroducerPunchTally {
+    inner: Option<Arc<NatTraversalEndpoint>>,
+}
+
+impl IntroducerPunchTally {
+    fn new(inner: &Arc<NatTraversalEndpoint>) -> Self {
+        Self {
+            inner: Some(Arc::clone(inner)),
+        }
+    }
+
+    fn finish(mut self, reached: bool) {
+        if let Some(inner) = self.inner.take() {
+            inner.record_introducer_punch(reached);
+        }
+    }
+}
+
+impl Drop for IntroducerPunchTally {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            inner.record_introducer_punch(false);
+        }
+    }
+}
+
 /// Budget for the direct (Happy Eyeballs) stage of the fallback ladder.
 ///
 /// The adaptive direct budget (`configured_timeout`, 4 x RTT + 750 ms) is a
@@ -4797,6 +4833,36 @@ impl P2pEndpoint {
         }
     }
 
+    /// The introducer a burst connect to `target` uses next: its own hints
+    /// first, then known peers when allowed; never one of its own addresses,
+    /// one being hung up on or one whose dial already `failed` in this
+    /// connect. One another connect holds is preferred.
+    fn next_introducer(
+        &self,
+        target: PeerId,
+        target_addrs: [Option<SocketAddr>; 2],
+        failed: &[SocketAddr],
+    ) -> Option<SocketAddr> {
+        let mut candidates = self.inner.introducer_hints_for(&target);
+        if self.inner.known_peer_introducers_allowed() {
+            for addr in self.runtime_known_peer_udp_addrs() {
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+        }
+        candidates.retain(|addr| {
+            !target_addrs.contains(&Some(*addr))
+                && !failed.contains(addr)
+                && !self.inner.introducer_is_closing(*addr)
+        });
+        candidates
+            .iter()
+            .copied()
+            .find(|addr| self.inner.introducer_is_held(*addr))
+            .or_else(|| candidates.first().copied())
+    }
+
     async fn find_live_connection_for_addrs(&self, addrs: &[SocketAddr]) -> Option<PeerConnection> {
         let peers = self.connected_peers.read().await;
         for addr in addrs {
@@ -5953,23 +6019,7 @@ impl P2pEndpoint {
                 // budget, its own hints first, then known peers. One that
                 // another connect holds is joined first; one being hung up on
                 // is skipped.
-                let targets = [target_ipv4, target_ipv6];
-                let mut candidates = self.inner.introducer_hints_for(&target_peer);
-                if self.inner.known_peer_introducers_allowed() {
-                    for addr in self.runtime_known_peer_udp_addrs() {
-                        if !candidates.contains(&addr) {
-                            candidates.push(addr);
-                        }
-                    }
-                }
-                candidates.retain(|addr| {
-                    !targets.contains(&Some(*addr)) && !self.inner.introducer_is_closing(*addr)
-                });
-                let choice = candidates
-                    .iter()
-                    .copied()
-                    .find(|addr| self.inner.introducer_is_held(*addr))
-                    .or_else(|| candidates.first().copied());
+                let choice = self.next_introducer(target_peer, [target_ipv4, target_ipv6], &[]);
                 // Hold first, then spend: a hold refused (the introducer
                 // turned closing) leaves the target's budget unspent, and a
                 // spent budget releases the hold.
@@ -6124,6 +6174,8 @@ impl P2pEndpoint {
         }
 
         let mut punch_started = false;
+        // Introducers whose dial failed during this connect.
+        let mut failed_introducers: Vec<SocketAddr> = Vec::new();
         loop {
             if punch_started
                 && introducer.is_some()
@@ -6368,6 +6420,9 @@ impl P2pEndpoint {
                     let via_introducer = introducer
                         .as_ref()
                         .is_some_and(|guard| guard.addr == coordinator);
+                    // Counted as a failure unless the round reaches the
+                    // target, also when this connect is dropped mid-round.
+                    let mut tally = via_introducer.then(|| IntroducerPunchTally::new(&self.inner));
                     let mut may_dial_coordinator = policy == CoordinatorPolicy::Any;
                     let mut dialling_introducer = false;
                     if policy == CoordinatorPolicy::Introducer && via_introducer {
@@ -6397,23 +6452,68 @@ impl P2pEndpoint {
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
-                    let started = self
-                        .start_hole_punch_session(coordinator, target_peer_id, may_dial_coordinator)
-                        .await;
                     if dialling_introducer {
-                        // A dial to an introducer the target did not name is
-                        // the known-peer (seed) fallback.
+                        // Counted when it starts, so a dial this connect
+                        // never sees the end of still shows. A dial to an
+                        // introducer the target did not name is the
+                        // known-peer (seed) fallback.
                         let named = self
                             .inner
                             .introducer_hints_for(&target_peer_id)
                             .contains(&crate::shared::normalize_socket_addr(coordinator));
                         self.inner.record_introducer_dial(!named);
-                        if !self.is_connected_to_addr(coordinator).await {
+                    }
+                    // A burst's introducer dial gets a short share of the
+                    // burst, so a stale introducer fails fast and the next
+                    // one can still be tried.
+                    let dial_budget = (policy == CoordinatorPolicy::Introducer).then(|| {
+                        INTRODUCER_DIAL_BUDGET.min(
+                            stage_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                    });
+                    let started = self
+                        .start_hole_punch_session(
+                            coordinator,
+                            target_peer_id,
+                            may_dial_coordinator,
+                            dial_budget,
+                        )
+                        .await;
+                    let introducer_up =
+                        !via_introducer || self.is_connected_to_addr(coordinator).await;
+                    if dialling_introducer {
+                        if !introducer_up {
                             self.inner.mark_introducer_dial_failed(coordinator);
                         }
                         if let Some(stable_id) = self.connection_id_for_addr(coordinator).await {
                             self.inner
                                 .note_introducer_connection(coordinator, stable_id);
+                        }
+                    }
+                    if started.is_err() && !introducer_up {
+                        // The introducer could not be reached, so it
+                        // introduced nothing: try the target's next one.
+                        if let Some(tally) = tally.take() {
+                            tally.finish(false);
+                        }
+                        failed_introducers.push(coordinator);
+                        if let Some(next) = self.next_introducer(
+                            target_peer_id,
+                            [target_ipv4, target_ipv6],
+                            &failed_introducers,
+                        ) {
+                            if let Some(guard) = introducer.take() {
+                                guard.finish().await;
+                            }
+                            if let Some(guard) = IntroducerGuard::hold(self, next) {
+                                info!(
+                                    "Introducer {} unreachable; using introducer {} for {:?}",
+                                    coordinator, next, target_peer_id
+                                );
+                                introducer = Some(guard);
+                                strategy.set_coordinator(next);
+                                continue;
+                            }
                         }
                     }
                     match started {
@@ -6423,8 +6523,8 @@ impl P2pEndpoint {
                         {
                             Ok(conn) => {
                                 info!("✓ Hole-punch succeeded to {} via {}", target, coordinator);
-                                if via_introducer {
-                                    self.inner.record_introducer_punch(true);
+                                if let Some(tally) = tally.take() {
+                                    tally.finish(true);
                                 }
                                 if let Some(guard) = introducer.take() {
                                     guard.finish().await;
@@ -6432,8 +6532,8 @@ impl P2pEndpoint {
                                 return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
                             }
                             Err(error) => {
-                                if via_introducer {
-                                    self.inner.record_introducer_punch(false);
+                                if let Some(tally) = tally.take() {
+                                    tally.finish(false);
                                 }
                                 let retryable = strategy.should_retry_holepunch()
                                     && error
@@ -6455,8 +6555,8 @@ impl P2pEndpoint {
                             }
                         },
                         Err(e) => {
-                            if via_introducer {
-                                self.inner.record_introducer_punch(false);
+                            if let Some(tally) = tally.take() {
+                                tally.finish(false);
                             }
                             let retryable = strategy.should_retry_holepunch()
                                 && match &e {
@@ -6692,6 +6792,7 @@ impl P2pEndpoint {
         coordinator: SocketAddr,
         peer_id: PeerId,
         may_dial_coordinator: bool,
+        dial_budget: Option<Duration>,
     ) -> Result<(), EndpointError> {
         if !self.is_connected_to_addr(coordinator).await {
             // The coordinator was live when the connect chose it but has
@@ -6710,7 +6811,15 @@ impl P2pEndpoint {
                 )));
             }
             debug!("Connecting to coordinator {} first", coordinator);
-            self.connect_direct_addr(coordinator).await?;
+            match dial_budget {
+                Some(budget) => {
+                    self.connect_direct_addr_with_hint_within(coordinator, None, budget)
+                        .await?;
+                }
+                None => {
+                    self.connect_direct_addr(coordinator).await?;
+                }
+            }
         }
         #[cfg(test)]
         self.inner.note_punch_start_for_test(coordinator);
@@ -17354,6 +17463,109 @@ mod tests {
         target.shutdown().await;
         seed.shutdown().await;
         seed_task.abort();
+    }
+
+    /// A target linked to `introducer`, and a client in a burst (relay
+    /// fallback off, no known peers) with accept loops running.
+    async fn burst_to_target_behind(
+        introducer_addr: SocketAddr,
+    ) -> (
+        P2pEndpoint,
+        tokio::task::JoinHandle<()>,
+        P2pEndpoint,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let target = fixed_port_endpoint(loopback_ephemeral_addr()).await;
+        let target_accept = tokio::spawn({
+            let target = target.clone();
+            async move { while target.accept().await.is_some() {} }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            target.connect_addr(introducer_addr),
+        )
+        .await
+        .expect("connect does not time out")
+        .expect("the target reaches its introducer");
+        let client = loopback_endpoint_with(|builder| builder).await;
+        let client_accept = tokio::spawn({
+            let client = client.clone();
+            async move { while client.accept().await.is_some() {} }
+        });
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        (target, target_accept, client, client_accept)
+    }
+
+    /// A burst whose first introducer is stale (its address is silent)
+    /// gives that dial only a short share of the burst, then punches
+    /// through the target's next introducer inside the embedder's 12 s
+    /// wait. The failed dial and its failed round are counted.
+    #[tokio::test]
+    async fn a_stale_introducer_fails_fast_and_the_next_one_punches() {
+        let (good, good_addr, good_accepts, good_task) = counting_endpoint().await;
+        let (target, target_accept, client, client_accept) =
+            burst_to_target_behind(good_addr).await;
+        wait_until("the good introducer holds the target's link", || {
+            good_accepts.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let (stale, stale_addr) = silent_target();
+        client.set_peer_introducers(target.peer_id(), vec![stale_addr, good_addr]);
+
+        let (silent, silent_addr) = silent_target();
+        let connection = tokio::time::timeout(
+            Duration::from_secs(12),
+            client.connect_peer_with_addrs(target.peer_id(), vec![silent_addr]),
+        )
+        .await
+        .expect("the burst reaches the target inside 12 s")
+        .expect("the next introducer's punch reaches the target");
+        assert_eq!(connection.peer_id, target.peer_id());
+        assert_eq!(connection.traversal_method, TraversalMethod::HolePunch);
+        let stats = client.introducer_stats();
+        assert_eq!(stats.dials, 2, "the stale dial and the good one: {stats:?}");
+        assert_eq!(stats.known_peer_dials, 0, "{stats:?}");
+        assert_eq!(stats.punch_successes, 1, "{stats:?}");
+        assert!(stats.punch_failures >= 1, "the stale round: {stats:?}");
+
+        drop((stale, silent));
+        client_accept.abort();
+        target_accept.abort();
+        client.shutdown().await;
+        target.shutdown().await;
+        good.shutdown().await;
+        good_task.abort();
+    }
+
+    /// A burst dropped by its embedder while it is still dialling a silent
+    /// introducer has already counted that dial and counts its round as a
+    /// failure, so diagnostics never read "no introducer was used".
+    #[tokio::test]
+    async fn a_dropped_burst_still_counts_its_introducer_attempt() {
+        let client = loopback_endpoint_with(|builder| builder).await;
+        client.set_relay_fallback_allowed(false);
+        client.set_coordinator_policy(CoordinatorPolicy::Introducer);
+        let target = PeerId([0x5c; 32]);
+        let (stale, stale_addr) = silent_target();
+        client.set_peer_introducers(target, vec![stale_addr]);
+        let (silent, silent_addr) = silent_target();
+
+        // The 2 s pre-pass and the direct stage end at about 4 s; the
+        // introducer dial then runs for up to 3 s.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(5500),
+            client.connect_peer_with_addrs(target, vec![silent_addr]),
+        )
+        .await;
+        assert!(dropped.is_err(), "dropped while dialling the introducer");
+        let stats = client.introducer_stats();
+        assert_eq!(stats.dials, 1, "{stats:?}");
+        assert_eq!(stats.punch_successes, 0, "{stats:?}");
+        assert!(stats.punch_failures >= 1, "{stats:?}");
+
+        drop((stale, silent));
+        client.shutdown().await;
     }
 
     /// `peer_introducers` reads back what `set_peer_introducers` recorded,

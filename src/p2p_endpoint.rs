@@ -11529,6 +11529,35 @@ impl P2pEndpoint {
         self.inner.inbound_punch_allowed()
     }
 
+    /// Answer or ignore new inbound connection attempts at runtime. With
+    /// `false`, the first packet of every new attempt is dropped before any
+    /// handshake work and nothing is sent back, so the remote side's
+    /// attempt times out instead of being refused or accepted and closed.
+    /// Connections already up and this endpoint's own connects, hole
+    /// punches included, are untouched. Allowed by default. See
+    /// [`NatTraversalEndpoint::set_inbound_connections_allowed`].
+    pub fn set_inbound_connections_allowed(&self, allowed: bool) {
+        self.inner.set_inbound_connections_allowed(allowed);
+    }
+
+    /// Whether new inbound connection attempts are answered (see
+    /// [`Self::set_inbound_connections_allowed`]).
+    pub fn inbound_connections_allowed(&self) -> bool {
+        self.inner.inbound_connections_allowed()
+    }
+
+    /// How many inbound connection attempts were ignored, counted per
+    /// packet dropped (see [`Self::set_inbound_connections_allowed`]).
+    pub fn inbound_connections_ignored(&self) -> u64 {
+        self.inner.inbound_connections_ignored()
+    }
+
+    /// How many inbound connection attempts this endpoint answered: each
+    /// one it started a handshake for.
+    pub fn inbound_connections_answered(&self) -> u64 {
+        self.inner.inbound_connections_answered()
+    }
+
     /// Set which coordinators hole punching may use; see
     /// [`CoordinatorPolicy`]. `Any` by default.
     pub fn set_coordinator_policy(&self, policy: CoordinatorPolicy) {
@@ -16768,6 +16797,87 @@ mod tests {
             }
         });
         (endpoint, addr, accepted, task)
+    }
+
+    /// A UDP relay in front of `target`: what a dialler sends to the
+    /// returned address reaches `target`, and what `target` sends back is
+    /// counted and passed on.
+    async fn counting_udp_relay(
+        target: SocketAddr,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let front = tokio::net::UdpSocket::bind(loopback_ephemeral_addr())
+            .await
+            .expect("bind relay front");
+        let back = tokio::net::UdpSocket::bind(loopback_ephemeral_addr())
+            .await
+            .expect("bind relay back");
+        let addr = front.local_addr().expect("relay addr");
+        let replies = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let replies = Arc::clone(&replies);
+            async move {
+                let mut dialler = None;
+                let mut up = vec![0u8; 65_536];
+                let mut down = vec![0u8; 65_536];
+                loop {
+                    tokio::select! {
+                        Ok((len, from)) = front.recv_from(&mut up) => {
+                            dialler = Some(from);
+                            let _ = back.send_to(&up[..len], target).await;
+                        }
+                        Ok((len, _)) = back.recv_from(&mut down) => {
+                            replies.fetch_add(1, Ordering::SeqCst);
+                            if let Some(dialler) = dialler {
+                                let _ = front.send_to(&down[..len], dialler).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        (addr, replies, task)
+    }
+
+    /// With inbound connections not answered, a connection attempt gets no
+    /// reply at all: the dialler's connect is still pending when its own
+    /// timeout fires (no refusal, no close), not one datagram comes back,
+    /// and nothing is accepted. Answered again, the same dialler connects.
+    #[tokio::test]
+    async fn an_endpoint_ignoring_inbound_sends_nothing_back() {
+        let (listener, listener_addr, accepted, listener_task) = counting_endpoint().await;
+        assert!(listener.inbound_connections_allowed(), "allowed by default");
+        listener.set_inbound_connections_allowed(false);
+        assert!(!listener.inbound_connections_allowed());
+        let (relay_addr, replies, relay_task) = counting_udp_relay(listener_addr).await;
+        let dialler = loopback_endpoint_with(|builder| builder).await;
+
+        let attempt =
+            tokio::time::timeout(Duration::from_secs(3), dialler.connect_addr(relay_addr)).await;
+        assert!(
+            attempt.is_err(),
+            "the dialler sees its own timeout, not an answer: {attempt:?}"
+        );
+        assert_eq!(replies.load(Ordering::SeqCst), 0, "nothing sent back");
+        assert!(
+            listener.inbound_connections_ignored() > 0,
+            "the attempt's packets were dropped"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "nothing accepted");
+        assert_eq!(listener.inbound_connections_answered(), 0, "no handshake");
+        assert_eq!(listener.connected_peers().await.len(), 0);
+
+        listener.set_inbound_connections_allowed(true);
+        tokio::time::timeout(Duration::from_secs(10), dialler.connect_addr(relay_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("answered again, the dialler connects");
+        assert!(replies.load(Ordering::SeqCst) > 0);
+        assert!(listener.inbound_connections_answered() > 0);
+
+        relay_task.abort();
+        listener_task.abort();
+        dialler.shutdown().await;
+        listener.shutdown().await;
     }
 
     fn silent_target() -> (std::net::UdpSocket, SocketAddr) {

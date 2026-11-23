@@ -349,6 +349,11 @@ pub struct Endpoint {
     /// used to amortise `shrink_to_fit` so a mass reap releases index memory
     /// without per-removal churn (x0x#278).
     index_compacted_at_capacity: usize,
+    /// Whether new inbound connection attempts are answered
+    /// ([`Self::set_inbound_allowed`]).
+    inbound_allowed: bool,
+    /// Inbound connection attempts dropped while they were not answered.
+    inbound_ignored: u64,
 }
 
 impl Endpoint {
@@ -389,12 +394,37 @@ impl Endpoint {
             pending_relay_events: Vec::new(),
             pending_peer_address_updates: Vec::new(),
             index_compacted_at_capacity: 0,
+            inbound_allowed: true,
+            inbound_ignored: 0,
         }
     }
 
     /// Replace the server configuration, affecting new incoming connections only
     pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
         self.server_config = server_config;
+    }
+
+    /// Answer or ignore new inbound connection attempts. With `false`, the
+    /// first packet of an attempt is dropped before its Initial keys are
+    /// derived: no handshake state is created and nothing is sent back (no
+    /// handshake, no close, no retry, no version negotiation), so the
+    /// remote side's retransmissions are dropped in turn until its attempt
+    /// times out. Existing connections and outgoing connects are untouched.
+    /// Allowed by default.
+    pub fn set_inbound_allowed(&mut self, allowed: bool) {
+        self.inbound_allowed = allowed;
+    }
+
+    /// Whether new inbound connection attempts are answered (see
+    /// [`Self::set_inbound_allowed`]).
+    pub fn inbound_allowed(&self) -> bool {
+        self.inbound_allowed
+    }
+
+    /// How many packets that would have started an inbound connection were
+    /// dropped because inbound attempts were not answered.
+    pub fn inbound_ignored(&self) -> u64 {
+        self.inbound_ignored
     }
 
     /// Register a peer ID with a connection handle for relay functionality
@@ -813,6 +843,11 @@ impl Endpoint {
                     debug!("dropping packet with unsupported version");
                     return None;
                 }
+                if !self.inbound_allowed {
+                    trace!("dropping packet with unsupported version: inbound not answered");
+                    self.inbound_ignored += 1;
+                    return None;
+                }
                 trace!("sending version negotiation");
                 // Negotiate versions
                 Header::VersionNegotiate {
@@ -1073,6 +1108,14 @@ impl Endpoint {
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
         let dst_cid = event.first_decode.dst_cid();
+        if !self.inbound_allowed {
+            trace!(
+                "ignoring connection attempt from {}: inbound not answered",
+                addresses.remote
+            );
+            self.inbound_ignored += 1;
+            return None;
+        }
         let Some(header) = event.first_decode.initial_header() else {
             debug!(
                 "unable to extract initial header for connection {}",

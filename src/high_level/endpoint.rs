@@ -210,7 +210,10 @@ impl Endpoint {
         self.inner
             .state
             .lock()
-            .map(|state| state.stats)
+            .map(|state| EndpointStats {
+                ignored_handshakes: state.stats.ignored_handshakes + state.inner.inbound_ignored(),
+                ..state.stats
+            })
             .unwrap_or_else(|_| {
                 error!("Endpoint state mutex poisoned");
                 EndpointStats::default()
@@ -638,6 +641,31 @@ impl Endpoint {
             .lock()
             .map(|state| state.buffered_registry.totals())
             .unwrap_or((0, 0, 0, 0))
+    }
+
+    /// Answer or ignore new inbound connection attempts. With `false`, the
+    /// first packet of every new attempt is dropped before any handshake
+    /// work, and nothing is sent back, so the remote side sees its attempt
+    /// time out rather than a refusal. Attempts already past their first
+    /// packet, existing connections and outgoing connects are untouched.
+    /// Each dropped packet counts in [`EndpointStats::ignored_handshakes`].
+    /// Allowed by default.
+    pub fn set_inbound_allowed(&self, allowed: bool) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.inner.set_inbound_allowed(allowed);
+        } else {
+            error!("Failed to set inbound admission: endpoint state mutex poisoned");
+        }
+    }
+
+    /// Whether new inbound connection attempts are answered (see
+    /// [`Self::set_inbound_allowed`]).
+    pub fn inbound_allowed(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.inner.inbound_allowed())
+            .unwrap_or(true)
     }
 
     /// Set the maximum number of simultaneously live connections the endpoint

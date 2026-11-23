@@ -593,6 +593,17 @@ impl Node {
         self.inner.inbound_punch_allowed()
     }
 
+    /// Answer or ignore new inbound connection attempts at runtime. See
+    /// [`P2pEndpoint::set_inbound_connections_allowed`].
+    pub fn set_inbound_connections_allowed(&self, allowed: bool) {
+        self.inner.set_inbound_connections_allowed(allowed);
+    }
+
+    /// Whether new inbound connection attempts are answered.
+    pub fn inbound_connections_allowed(&self) -> bool {
+        self.inner.inbound_connections_allowed()
+    }
+
     /// Set which coordinators hole punching may use. See
     /// [`crate::CoordinatorPolicy`].
     pub fn set_coordinator_policy(&self, policy: crate::CoordinatorPolicy) {

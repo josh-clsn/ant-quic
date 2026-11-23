@@ -8284,6 +8284,43 @@ impl NatTraversalEndpoint {
         self.inbound_punch_allowed.store(allowed, Ordering::SeqCst);
     }
 
+    /// Answer or ignore new inbound connection attempts on this endpoint's
+    /// socket. With `false`, the first packet of every new attempt is
+    /// dropped before any handshake work and nothing is sent back: the
+    /// remote side's attempt times out, and no reply of this endpoint
+    /// refreshes a NAT mapping toward it. Connections already up, attempts
+    /// already past their first packet and this endpoint's own connects
+    /// (hole punches included) are untouched. Allowed by default.
+    pub fn set_inbound_connections_allowed(&self, allowed: bool) {
+        if let Some(endpoint) = self.inner_endpoint.as_ref() {
+            endpoint.set_inbound_allowed(allowed);
+        }
+    }
+
+    /// Whether new inbound connection attempts are answered (see
+    /// [`Self::set_inbound_connections_allowed`]).
+    pub fn inbound_connections_allowed(&self) -> bool {
+        self.inner_endpoint
+            .as_ref()
+            .is_none_or(InnerEndpoint::inbound_allowed)
+    }
+
+    /// How many inbound connection attempts were ignored, counted per
+    /// packet dropped (see [`Self::set_inbound_connections_allowed`]).
+    pub fn inbound_connections_ignored(&self) -> u64 {
+        self.inner_endpoint
+            .as_ref()
+            .map_or(0, |endpoint| endpoint.stats().ignored_handshakes)
+    }
+
+    /// How many inbound connection attempts this endpoint answered: each
+    /// one it started a handshake for.
+    pub fn inbound_connections_answered(&self) -> u64 {
+        self.inner_endpoint
+            .as_ref()
+            .map_or(0, |endpoint| endpoint.stats().accepted_handshakes)
+    }
+
     /// Which coordinators hole punching may use.
     pub fn coordinator_policy(&self) -> CoordinatorPolicy {
         CoordinatorPolicy::from_u8(self.coordinator_policy.load(Ordering::SeqCst))

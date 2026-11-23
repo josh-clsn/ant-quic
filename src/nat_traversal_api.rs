@@ -7069,6 +7069,15 @@ impl NatTraversalEndpoint {
     ) {
         while !shutdown.load(Ordering::Relaxed) {
             match endpoint.accept().await {
+                Some(connecting) if !endpoint.inbound_allowed() => {
+                    // Its first packet came before inbound attempts were
+                    // turned off: still nothing is answered.
+                    debug!(
+                        "ignoring queued connection attempt from {}: inbound not answered",
+                        connecting.remote_address()
+                    );
+                    connecting.ignore();
+                }
                 Some(connecting) => {
                     let event_tx = event_tx.clone();
                     let connections = connections.clone();
@@ -8288,9 +8297,11 @@ impl NatTraversalEndpoint {
     /// socket. With `false`, the first packet of every new attempt is
     /// dropped before any handshake work and nothing is sent back: the
     /// remote side's attempt times out, and no reply of this endpoint
-    /// refreshes a NAT mapping toward it. Connections already up, attempts
-    /// already past their first packet and this endpoint's own connects
-    /// (hole punches included) are untouched. Allowed by default.
+    /// refreshes a NAT mapping toward it. An attempt whose first packet
+    /// came earlier and is still waiting in the accept queue is ignored
+    /// there, also with no answer. Connections already up and this
+    /// endpoint's own connects (hole punches included) are untouched.
+    /// Allowed by default.
     pub fn set_inbound_connections_allowed(&self, allowed: bool) {
         if let Some(endpoint) = self.inner_endpoint.as_ref() {
             endpoint.set_inbound_allowed(allowed);

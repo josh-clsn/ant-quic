@@ -211,7 +211,7 @@ impl Endpoint {
             .state
             .lock()
             .map(|state| EndpointStats {
-                ignored_handshakes: state.stats.ignored_handshakes + state.inner.inbound_ignored(),
+                ignored_inbound_packets: state.inner.inbound_ignored(),
                 ..state.stats
             })
             .unwrap_or_else(|_| {
@@ -648,7 +648,7 @@ impl Endpoint {
     /// work, and nothing is sent back, so the remote side sees its attempt
     /// time out rather than a refusal. Attempts already past their first
     /// packet, existing connections and outgoing connects are untouched.
-    /// Each dropped packet counts in [`EndpointStats::ignored_handshakes`].
+    /// Each dropped packet counts in [`EndpointStats::ignored_inbound_packets`].
     /// Allowed by default.
     pub fn set_inbound_allowed(&self, allowed: bool) {
         if let Ok(mut state) = self.inner.state.lock() {
@@ -753,6 +753,11 @@ pub struct EndpointStats {
     pub refused_handshakes: u64,
     /// Cummulative number of Quic handshakes ignored on this [Endpoint]
     pub ignored_handshakes: u64,
+    /// Cumulative number of packets that would have started an inbound
+    /// connection and were dropped unanswered while inbound attempts were
+    /// not answered ([`Endpoint::set_inbound_allowed`]); a dialler's
+    /// retransmissions count one each
+    pub ignored_inbound_packets: u64,
 }
 
 /// A future that drives IO on an endpoint

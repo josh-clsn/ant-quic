@@ -8305,12 +8305,13 @@ impl NatTraversalEndpoint {
             .is_none_or(InnerEndpoint::inbound_allowed)
     }
 
-    /// How many inbound connection attempts were ignored, counted per
-    /// packet dropped (see [`Self::set_inbound_connections_allowed`]).
+    /// How many packets of inbound connection attempts were dropped
+    /// unanswered, one per packet (see
+    /// [`Self::set_inbound_connections_allowed`]).
     pub fn inbound_connections_ignored(&self) -> u64 {
         self.inner_endpoint
             .as_ref()
-            .map_or(0, |endpoint| endpoint.stats().ignored_handshakes)
+            .map_or(0, |endpoint| endpoint.stats().ignored_inbound_packets)
     }
 
     /// How many inbound connection attempts this endpoint answered: each

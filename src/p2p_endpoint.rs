@@ -11546,8 +11546,9 @@ impl P2pEndpoint {
         self.inner.inbound_connections_allowed()
     }
 
-    /// How many inbound connection attempts were ignored, counted per
-    /// packet dropped (see [`Self::set_inbound_connections_allowed`]).
+    /// How many packets of inbound connection attempts were dropped
+    /// unanswered, one per packet (see
+    /// [`Self::set_inbound_connections_allowed`]).
     pub fn inbound_connections_ignored(&self) -> u64 {
         self.inner.inbound_connections_ignored()
     }

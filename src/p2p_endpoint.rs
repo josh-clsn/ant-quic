@@ -16881,6 +16881,101 @@ mod tests {
         listener.shutdown().await;
     }
 
+    /// With inbound connections not answered, a packet for a connection
+    /// the endpoint has forgotten gets no stateless reset. Answered, the
+    /// same packet does get one (the control).
+    #[tokio::test]
+    async fn an_endpoint_ignoring_inbound_sends_no_stateless_reset() {
+        let (listener, listener_addr, _accepted, listener_task) = counting_endpoint().await;
+        let front = Arc::new(
+            tokio::net::UdpSocket::bind(loopback_ephemeral_addr())
+                .await
+                .expect("bind relay front"),
+        );
+        let back = Arc::new(
+            tokio::net::UdpSocket::bind(loopback_ephemeral_addr())
+                .await
+                .expect("bind relay back"),
+        );
+        let relay_addr = front.local_addr().expect("relay addr");
+        let replies = Arc::new(AtomicUsize::new(0));
+        let last_short: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let relay_task = tokio::spawn({
+            let (front, back) = (Arc::clone(&front), Arc::clone(&back));
+            let (replies, last_short) = (Arc::clone(&replies), Arc::clone(&last_short));
+            async move {
+                let mut dialler = None;
+                let mut up = vec![0u8; 65_536];
+                let mut down = vec![0u8; 65_536];
+                loop {
+                    tokio::select! {
+                        Ok((len, from)) = front.recv_from(&mut up) => {
+                            dialler = Some(from);
+                            if len > 40 && up[0] & 0x80 == 0 {
+                                *last_short.lock() = Some(up[..len].to_vec());
+                            }
+                            let _ = back.send_to(&up[..len], listener_addr).await;
+                        }
+                        Ok((len, _)) = back.recv_from(&mut down) => {
+                            replies.fetch_add(1, Ordering::SeqCst);
+                            if let Some(dialler) = dialler {
+                                let _ = front.send_to(&down[..len], dialler).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let dialler = loopback_endpoint_with(|builder| builder).await;
+        let link = tokio::time::timeout(Duration::from_secs(10), dialler.connect_addr(relay_addr))
+            .await
+            .expect("connect does not time out")
+            .expect("the dialler connects");
+        wait_until("a short-header packet went to the listener", || {
+            last_short.lock().is_some()
+        })
+        .await;
+        let packet = last_short.lock().clone().expect("recorded");
+        let dialler_id = dialler.peer_id();
+        let _ = listener.disconnect(&dialler_id).await;
+        let _ = dialler.disconnect(&link.peer_id).await;
+
+        // Control: once the listener has forgotten the connection, the
+        // recorded packet draws a stateless reset.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let before = replies.load(Ordering::SeqCst);
+            let _ = back.send_to(&packet, listener_addr).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if replies.load(Ordering::SeqCst) > before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no stateless reset with inbound on"
+            );
+        }
+
+        listener.set_inbound_connections_allowed(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = replies.load(Ordering::SeqCst);
+        for _ in 0..5 {
+            let _ = back.send_to(&packet, listener_addr).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            replies.load(Ordering::SeqCst),
+            before,
+            "no stateless reset while inbound is not answered"
+        );
+
+        relay_task.abort();
+        listener_task.abort();
+        dialler.shutdown().await;
+        listener.shutdown().await;
+    }
+
     fn silent_target() -> (std::net::UdpSocket, SocketAddr) {
         let silent = std::net::UdpSocket::bind(loopback_ephemeral_addr()).expect("bind silent");
         let addr = silent.local_addr().expect("silent addr");

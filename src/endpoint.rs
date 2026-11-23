@@ -409,8 +409,9 @@ impl Endpoint {
     /// derived: no handshake state is created and nothing is sent back (no
     /// handshake, no close, no retry, no version negotiation), so the
     /// remote side's retransmissions are dropped in turn until its attempt
-    /// times out. Existing connections and outgoing connects are untouched.
-    /// Allowed by default.
+    /// times out. No stateless reset is sent either, for a packet to a
+    /// connection this endpoint no longer knows. Existing connections and
+    /// outgoing connects are untouched. Allowed by default.
     pub fn set_inbound_allowed(&mut self, allowed: bool) {
         self.inbound_allowed = allowed;
     }
@@ -947,6 +948,10 @@ impl Endpoint {
         dst_cid: ConnectionId,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
+        if !self.inbound_allowed {
+            trace!("no stateless reset: inbound not answered");
+            return None;
+        }
         if self
             .last_stateless_reset
             .is_some_and(|last| last + self.config.min_reset_interval > now)

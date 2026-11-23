@@ -1902,8 +1902,9 @@ pub struct NatTraversalEndpoint {
     introducer_known_peer_dials: AtomicU64,
     introducer_punch_successes: AtomicU64,
     introducer_punch_failures: AtomicU64,
-    /// Whether a target with no introducer of its own may use a known peer
-    /// (bootstrap seed) as its introducer.
+    /// Whether a known peer (bootstrap seed) may be a target's introducer:
+    /// tried after the target's own introducers, so when it named none or
+    /// none of them could be reached.
     known_peer_introducers_allowed: AtomicBool,
     /// Open introducers by address ([`IntroducerEntry`]).
     introducer_refs: ParkingMutex<HashMap<SocketAddr, IntroducerEntry>>,
@@ -8321,8 +8322,8 @@ impl NatTraversalEndpoint {
         self.introducer_spent.lock().clear();
     }
 
-    /// Whether a target with no introducer of its own may use a known peer
-    /// as its introducer (see [`Self::set_known_peer_introducers_allowed`]).
+    /// Whether a known peer may be a target's introducer, tried after the
+    /// target's own introducers (see [`Self::set_known_peer_introducers_allowed`]).
     pub fn known_peer_introducers_allowed(&self) -> bool {
         self.known_peer_introducers_allowed.load(Ordering::SeqCst)
     }

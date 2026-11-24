@@ -785,7 +785,7 @@ pub struct EndpointStats {
     /// Cumulative number of packets that would have started an inbound
     /// connection and were dropped unanswered while inbound attempts were
     /// not answered ([`Endpoint::set_inbound_allowed`]); a dialler's
-    /// retransmissions count one each
+    /// retransmissions count one each.
     pub ignored_inbound_packets: u64,
 }
 

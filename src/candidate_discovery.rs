@@ -1205,13 +1205,13 @@ impl CandidateDiscoveryManager {
             .min()
     }
 
-    /// Clean up sessions that have been completed for longer than the specified duration
     /// Forget the discovery session for `peer_id`, whatever its phase, so
     /// a new traversal to it can start discovery again at once.
     pub(crate) fn end_discovery(&mut self, peer_id: PeerId) {
         self.active_sessions.remove(&peer_id);
     }
 
+    /// Clean up sessions that have been completed for longer than the specified duration
     pub fn cleanup_stale_sessions(&mut self, max_age: Duration) {
         let now = Instant::now();
         let stale: Vec<PeerId> = self

@@ -8314,10 +8314,33 @@ impl NatTraversalEndpoint {
     /// goes quiet: an inbound attempt answered just before would otherwise
     /// go on re-sending its handshake flight until it timed out.
     /// Established connections are not touched.
+    ///
+    /// Every hole-punch session whose peer has no live connection is retired
+    /// with them (its punch dials were among the handshakes, or its
+    /// coordination had not landed yet): a later traversal to that peer
+    /// starts a fresh session and sends a fresh coordination request,
+    /// instead of deduplicating against the dead one until it times out,
+    /// and a late `CoordinationAccepted` for it starts no dial.
     pub fn abandon_handshakes(&self) {
         if let Some(endpoint) = self.inner_endpoint.as_ref() {
             let asked = endpoint.abandon_handshakes();
             debug!(asked, "abandoning connections still in their handshake");
+        }
+        // Lock order: active_sessions before connections, as in poll().
+        let unconnected: Vec<PeerId> = self
+            .active_sessions
+            .iter()
+            .filter(|entry| !self.connections.contains_key(entry.key()))
+            .map(|entry| *entry.key())
+            .collect();
+        for peer_id in unconnected {
+            self.active_sessions.remove(&peer_id);
+            self.discovery_manager.lock().end_discovery(peer_id);
+            let _ = clear_live_request(self.local_peer_id(), peer_id);
+            debug!(
+                "retired the hole-punch session for {:?} with its abandoned dials",
+                peer_id
+            );
         }
     }
 
@@ -17699,6 +17722,53 @@ mod tests {
             result.is_ok(),
             "duplicate initiate for tracked peer must dedup cleanly, got {result:?}"
         );
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    /// Review R2-L2: a hole-punch session whose dials were abandoned is
+    /// retired with them. Without that, a later traversal to the same peer
+    /// deduplicated against the dead session (here marked by its attempt
+    /// count, in its validation phase) and sent no coordination request
+    /// until the session timed out. After `abandon_handshakes` the next
+    /// initiate starts a fresh session.
+    #[tokio::test]
+    async fn abandoning_handshakes_retires_an_unconnected_punch_session() {
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+        let target = PeerId([0xC7; 32]);
+        let coordinator: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        endpoint
+            .initiate_nat_traversal(target, coordinator)
+            .expect("the first punch starts");
+        {
+            let mut session = endpoint
+                .active_sessions
+                .get_mut(&target)
+                .expect("a session is tracked");
+            session.phase = TraversalPhase::Validation;
+            session.attempt = 7;
+        }
+
+        endpoint.abandon_handshakes();
+        assert!(
+            !endpoint.active_sessions.contains_key(&target),
+            "the abandoned punch's session is retired"
+        );
+        endpoint
+            .initiate_nat_traversal(target, coordinator)
+            .expect("the next punch starts");
+        let session = endpoint
+            .active_sessions
+            .get(&target)
+            .expect("a fresh session is tracked");
+        assert_eq!(session.attempt, 1, "a fresh session, not the dead one");
+        drop(session);
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }

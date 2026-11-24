@@ -4870,18 +4870,34 @@ impl NatTraversalEndpoint {
             );
             return Err(NatTraversalError::TooManySessions);
         }
-        match self.active_sessions.entry(peer_id) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
+        // Only a live session absorbs a new initiate. A `Closed` or `Failed`
+        // one (its punch ended, or its link was swept) is replaced: deduping
+        // against it would send no coordination request until the reaper
+        // removed it.
+        let replaced_stale = match self.active_sessions.entry(peer_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                let existing = slot.get();
+                if existing.session_state.state != ConnectionState::Closed
+                    && existing.phase != TraversalPhase::Failed
+                {
+                    debug!(
+                        "NAT traversal already in progress for peer {:?}, skipping duplicate request",
+                        peer_id
+                    );
+                    return Ok(()); // Already handling this peer, not an error
+                }
                 debug!(
-                    "NAT traversal already in progress for peer {:?}, skipping duplicate request",
+                    "replacing the ended NAT traversal session for peer {:?}",
                     peer_id
                 );
-                return Ok(()); // Already handling this peer, not an error
+                slot.insert(session);
+                true
             }
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 slot.insert(session);
+                false
             }
-        }
+        };
 
         // Start candidate discovery - parking_lot::RwLock doesn't poison
         let bootstrap_nodes_vec = self.bootstrap_nodes.read().clone();
@@ -4889,6 +4905,9 @@ impl NatTraversalEndpoint {
         {
             // parking_lot::Mutex doesn't poison
             let mut discovery = self.discovery_manager.lock();
+            if replaced_stale {
+                discovery.end_discovery(peer_id);
+            }
 
             discovery
                 .start_discovery(peer_id, bootstrap_nodes_vec)
@@ -17769,6 +17788,69 @@ mod tests {
             .expect("a fresh session is tracked");
         assert_eq!(session.attempt, 1, "a fresh session, not the dead one");
         drop(session);
+
+        endpoint.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    /// Review R3-L3: an ended session (here `Closed`, as the reaper leaves
+    /// one after its link was swept) no longer absorbs a new initiate. The
+    /// new punch replaces it and requests coordination afresh, instead of
+    /// waiting until the reaper removed the dead session.
+    #[tokio::test]
+    async fn a_new_punch_replaces_an_ended_session() {
+        let requested: Arc<parking_lot::Mutex<Vec<PeerId>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let callback: Box<dyn Fn(NatTraversalEvent) + Send + Sync> = {
+            let requested = Arc::clone(&requested);
+            Box::new(move |event| {
+                if let NatTraversalEvent::CoordinationRequested { peer_id, .. } = event {
+                    requested.lock().push(peer_id);
+                }
+            })
+        };
+        let config = NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let endpoint = NatTraversalEndpoint::new(config, Some(callback), None)
+            .await
+            .expect("Endpoint creation should succeed");
+        let target = PeerId([0xC8; 32]);
+        let coordinator: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        endpoint
+            .initiate_nat_traversal(target, coordinator)
+            .expect("the first punch starts");
+        assert_eq!(requested.lock().len(), 1);
+        {
+            let mut session = endpoint
+                .active_sessions
+                .get_mut(&target)
+                .expect("a session is tracked");
+            session.session_state.state = ConnectionState::Closed;
+            session.attempt = 7;
+        }
+
+        endpoint
+            .initiate_nat_traversal(target, coordinator)
+            .expect("the next punch starts");
+        assert_eq!(
+            requested.lock().as_slice(),
+            &[target, target],
+            "a fresh coordination request for the new punch"
+        );
+        let session = endpoint
+            .active_sessions
+            .get(&target)
+            .expect("a session is tracked");
+        assert_eq!(session.attempt, 1, "the ended session was replaced");
+        assert_ne!(session.session_state.state, ConnectionState::Closed);
+        drop(session);
+
+        // A live session still absorbs a duplicate initiate.
+        endpoint
+            .initiate_nat_traversal(target, coordinator)
+            .expect("a duplicate initiate dedups");
+        assert_eq!(requested.lock().len(), 2, "no request for the duplicate");
 
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }

@@ -1677,6 +1677,12 @@ impl Connection {
                 // Enqueue PunchMeNow frame for transmission
                 self.spaces[SpaceId::Data].pending.punch_me_now.push(punch);
             }
+            AbandonHandshake => {
+                if self.state.is_handshake() {
+                    trace!("abandoning a connection still in its handshake");
+                    self.kill(ConnectionError::LocallyClosed);
+                }
+            }
         }
     }
 

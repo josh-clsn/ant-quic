@@ -11546,6 +11546,14 @@ impl P2pEndpoint {
         self.inner.inbound_connections_allowed()
     }
 
+    /// Drop every connection still in its handshake, inbound or outbound,
+    /// without sending anything more (no close, no further flight). Its
+    /// pending connect fails. Established connections are not touched. See
+    /// [`NatTraversalEndpoint::abandon_handshakes`].
+    pub fn abandon_handshakes(&self) {
+        self.inner.abandon_handshakes();
+    }
+
     /// How many packets of inbound connection attempts were dropped
     /// unanswered, one per packet (see
     /// [`Self::set_inbound_connections_allowed`]).
@@ -16970,6 +16978,74 @@ mod tests {
             "no stateless reset while inbound is not answered"
         );
 
+        relay_task.abort();
+        listener_task.abort();
+        dialler.shutdown().await;
+        listener.shutdown().await;
+    }
+
+    /// The latch tail: an inbound handshake answered just before the
+    /// endpoint goes quiet, whose replies never reach the dialler, used to
+    /// re-send its handshake flight until it timed out. Abandoned, it sends
+    /// nothing more and is gone, while the dialler keeps retrying.
+    #[tokio::test]
+    async fn an_abandoned_inbound_handshake_sends_nothing_more() {
+        let (listener, listener_addr, accepted, listener_task) = counting_endpoint().await;
+        let front = tokio::net::UdpSocket::bind(loopback_ephemeral_addr())
+            .await
+            .expect("bind relay front");
+        let back = tokio::net::UdpSocket::bind(loopback_ephemeral_addr())
+            .await
+            .expect("bind relay back");
+        let relay_addr = front.local_addr().expect("relay addr");
+        let replies = Arc::new(AtomicUsize::new(0));
+        // Forwards the dialler's packets, drops every reply (one-sided
+        // reach, as when the dialler's path died at a network move).
+        let relay_task = tokio::spawn({
+            let replies = Arc::clone(&replies);
+            async move {
+                let mut up = vec![0u8; 65_536];
+                let mut down = vec![0u8; 65_536];
+                loop {
+                    tokio::select! {
+                        Ok((len, _)) = front.recv_from(&mut up) => {
+                            let _ = back.send_to(&up[..len], listener_addr).await;
+                        }
+                        Ok(_) = back.recv_from(&mut down) => {
+                            replies.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        });
+        let dialler = loopback_endpoint_with(|builder| builder).await;
+        let dial = tokio::spawn({
+            let dialler = dialler.clone();
+            async move {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(20), dialler.connect_addr(relay_addr))
+                        .await;
+            }
+        });
+        wait_until("the listener answered with its handshake flight", || {
+            replies.load(Ordering::SeqCst) > 0
+        })
+        .await;
+
+        listener.set_inbound_connections_allowed(false);
+        listener.abandon_handshakes();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let at_abandon = replies.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            replies.load(Ordering::SeqCst),
+            at_abandon,
+            "nothing sent after the handshake was abandoned"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "nothing accepted");
+        assert!(listener.connected_peers().await.is_empty());
+
+        dial.abort();
         relay_task.abort();
         listener_task.abort();
         dialler.shutdown().await;

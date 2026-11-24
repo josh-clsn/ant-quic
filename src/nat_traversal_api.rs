@@ -8308,6 +8308,19 @@ impl NatTraversalEndpoint {
         }
     }
 
+    /// Drop every connection of this endpoint's socket that is still in
+    /// its handshake, inbound or outbound, without sending anything more.
+    /// Used with [`Self::set_inbound_connections_allowed`] when an embedder
+    /// goes quiet: an inbound attempt answered just before would otherwise
+    /// go on re-sending its handshake flight until it timed out.
+    /// Established connections are not touched.
+    pub fn abandon_handshakes(&self) {
+        if let Some(endpoint) = self.inner_endpoint.as_ref() {
+            let asked = endpoint.abandon_handshakes();
+            debug!(asked, "abandoning connections still in their handshake");
+        }
+    }
+
     /// Whether new inbound connection attempts are answered (see
     /// [`Self::set_inbound_connections_allowed`]).
     pub fn inbound_connections_allowed(&self) -> bool {

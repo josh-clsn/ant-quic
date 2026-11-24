@@ -658,6 +658,35 @@ impl Endpoint {
         }
     }
 
+    /// Drop every connection still in its handshake, inbound or outbound,
+    /// at once and without sending anything more: no close, no further
+    /// handshake flight. Its pending connect or accept fails with
+    /// [`ConnectionError::LocallyClosed`]. Established connections are not
+    /// touched. Returns how many connections were asked (each one still
+    /// handshaking drops itself).
+    pub fn abandon_handshakes(&self) -> usize {
+        let Ok(mut state) = self.inner.state.lock() else {
+            error!("Failed to abandon handshakes: endpoint state mutex poisoned");
+            return 0;
+        };
+        let handles: Vec<ConnectionHandle> = state
+            .recv_state
+            .connections
+            .senders
+            .keys()
+            .copied()
+            .collect();
+        for handle in &handles {
+            state.recv_state.connections.send_proto(
+                *handle,
+                crate::shared::ConnectionEvent(
+                    crate::shared::ConnectionEventInner::AbandonHandshake,
+                ),
+            );
+        }
+        handles.len()
+    }
+
     /// Whether new inbound connection attempts are answered (see
     /// [`Self::set_inbound_allowed`]).
     pub fn inbound_allowed(&self) -> bool {

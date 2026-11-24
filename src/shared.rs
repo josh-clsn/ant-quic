@@ -28,6 +28,9 @@ pub(crate) enum ConnectionEventInner {
     QueueAddAddress(crate::frame::AddAddress),
     /// Queue a PUNCH_ME_NOW frame for transmission
     QueuePunchMeNow(crate::frame::PunchMeNow),
+    /// Drop the connection at once, sending nothing more, if it is still
+    /// in its handshake
+    AbandonHandshake,
 }
 
 /// Variant of [`ConnectionEventInner`].
